@@ -1,54 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ==============================================================================
+# create-vm.sh — Create an Ubuntu Server VM (libvirt/virt-install) with cloud-init
+# ==============================================================================
+
 # ===============================
 # Defaults (safe to keep in-script)
 # ===============================
 
-# Ubuntu version (single source of truth)
-UBUNTU_VERSION="24.04.3"
+UBUNTU_VERSION_DEFAULT="24.04.3"
 
-# VM sizing
-RAM_MB="4096"
-MAX_RAM_MB="8192"
-VCPUS="2"
-MAX_VCPUS="2"
-DISK_SIZE_GB="50"
+RAM_MB_DEFAULT="4096"
+MAX_RAM_MB_DEFAULT="8192"
+VCPUS_DEFAULT="2"
+MAX_VCPUS_DEFAULT="2"
+DISK_SIZE_GB_DEFAULT="50"
 
-# Networking
-BRIDGE_IF="br0"
+BRIDGE_IF_DEFAULT="br0"         # prompted if not found
+OS_VARIANT_DEFAULT="ubuntu24.04"
 
-# OS variant (adjust if host doesn't know ubuntu24.04)
-OS_VARIANT="ubuntu24.04"
+LAN_SSH_CIDR_DEFAULT="192.168.1.0/24"
+VPN_SSH_CIDR_DEFAULT="192.168.254.0/24"
+TIMEZONE_DEFAULT="Europe/London"
 
-# Defaults for prompts (generic fallbacks; not user-specific)
-DEFAULT_LAN_SSH_CIDR="192.168.1.0/24"
-DEFAULT_VPN_SSH_CIDR="192.168.254.0/24"
-DEFAULT_TIMEZONE="Europe/London"
+PUBLIC_ALLOW_RULES_DEFAULT=(
+  # "25565/tcp"
+)
 
-# Effective config (may be overridden by profile; otherwise prompted)
-TIMEZONE=""
-LAN_SSH_CIDR=""
-VPN_SSH_CIDR=""
-declare -a PUBLIC_ALLOW_RULES=()
-
-# Create-profile (host-side) for re-use
-CREATE_PROFILE_PATH="/etc/create-vm-profile.conf"
-
-# Cleanup policy
-CLEANUP_VM_CLOUDINIT_DIR=true          # removes per-VM cloud-init seed after VM creation
-CLEANUP_OLD_UBUNTU_BOOT_DIRS=true      # removes older /var/lib/libvirt/boot/ubuntu-* dirs
-KEEP_UBUNTU_BOOT_DIRS=2                # keep newest N ubuntu-* dirs (sorted by version)
+CLEANUP_VM_CLOUDINIT_DIR=true
+CLEANUP_OLD_UBUNTU_BOOT_DIRS=true
+KEEP_UBUNTU_BOOT_DIRS=2
 
 # ===============================
 # Helpers
 # ===============================
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing required command: $1"; exit 1; }; }
-vm_exists() { sudo virsh dominfo "${1}" >/dev/null 2>&1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 confirm_yn() {
-  local prompt="$1"
-  local ans=""
+  local prompt="$1" ans=""
   while true; do
     read -r -p "${prompt} [y/N]: " ans
     case "${ans}" in
@@ -60,22 +50,17 @@ confirm_yn() {
 }
 
 prompt_nonempty() {
-  local varname="$1"
-  local prompt="$2"
-  local value=""
+  local varname="$1" prompt="$2" value=""
   while [[ -z "${value}" ]]; do
     read -r -p "${prompt}" value
-    value="${value#"${value%%[![:space:]]*}"}"   # ltrim
-    value="${value%"${value##*[![:space:]]}"}"   # rtrim
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
   done
   printf -v "${varname}" '%s' "${value}"
 }
 
 prompt_with_default() {
-  local varname="$1"
-  local prompt="$2"
-  local current="$3"
-  local value=""
+  local varname="$1" prompt="$2" current="$3" value=""
   read -r -p "${prompt} [${current}]: " value
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
@@ -94,168 +79,35 @@ validate_cidr() {
 prompt_password() {
   local p1="" p2=""
   while true; do
-    read -r -s -p "Enter admin password: " p1
-    echo
-    read -r -s -p "Confirm admin password: " p2
-    echo
-    if [[ -z "${p1}" ]]; then
-      echo "Password cannot be empty."
-      continue
-    fi
-    if [[ "${p1}" != "${p2}" ]]; then
-      echo "Passwords do not match. Try again."
-      continue
-    fi
+    read -r -s -p "Enter admin password: " p1; echo
+    read -r -s -p "Confirm admin password: " p2; echo
+    [[ -n "${p1}" ]] || { echo "Password cannot be empty."; continue; }
+    [[ "${p1}" == "${p2}" ]] || { echo "Passwords do not match. Try again."; continue; }
     ADMIN_PASS_PLAIN="${p1}"
     break
   done
 }
 
-array_contains() { local n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
-array_add_unique() { local v="$1"; array_contains "$v" "${PUBLIC_ALLOW_RULES[@]}" || PUBLIC_ALLOW_RULES+=( "$v" ); }
+vm_exists() { sudo virsh dominfo "${1}" >/dev/null 2>&1; }
 
-prompt_public_ports() {
-  echo
-  confirm_yn "Add any public ports to open to the internet (Anywhere)?" || return 0
-  echo "Enter <port>/<proto> e.g. 25565/tcp, 21116/udp. Blank line to finish."
-  local input=""
-  while true; do
-    read -r -p "> " input
-    [[ -z "$input" ]] && break
-    if [[ "$input" =~ ^[0-9]{1,5}/(tcp|udp)$ ]]; then
-      array_add_unique "$input"
-    else
-      echo "Invalid format."
-    fi
-  done
-}
-
-# ===============================
-# Create-profile (host-side)
-# ===============================
-load_create_profile_if_present() {
-  if [[ -f "${CREATE_PROFILE_PATH}" ]]; then
-    echo "Create-profile detected: ${CREATE_PROFILE_PATH}"
-    echo "Loading create-profile..."
-
-    local tmp
-    tmp="$(mktemp)"
-    sudo cat "${CREATE_PROFILE_PATH}" > "${tmp}"
-    # shellcheck disable=SC1090
-    source "${tmp}"
-    rm -f "${tmp}"
-
-    echo "Create-profile loaded."
-  else
-    echo "No create-profile found at ${CREATE_PROFILE_PATH}."
-  fi
-
-  # Ensure PUBLIC_ALLOW_RULES is an array
-  if ! declare -p PUBLIC_ALLOW_RULES >/dev/null 2>&1; then
-    declare -a PUBLIC_ALLOW_RULES=()
-  fi
-}
-
-save_create_profile() {
-  echo
-  echo "Create-profile save preview (will write to ${CREATE_PROFILE_PATH}):"
-  echo "  TIMEZONE=${TIMEZONE}"
-  echo "  LAN_SSH_CIDR=${LAN_SSH_CIDR}"
-  echo "  VPN_SSH_CIDR=${VPN_SSH_CIDR}"
-  echo "  BRIDGE_IF=${BRIDGE_IF}"
-  echo "  OS_VARIANT=${OS_VARIANT}"
-  echo "  UBUNTU_VERSION=${UBUNTU_VERSION}"
-  if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
-    echo "  PUBLIC_ALLOW_RULES:"
-    for p in "${PUBLIC_ALLOW_RULES[@]}"; do echo "    - ${p}"; done
-  else
-    echo "  PUBLIC_ALLOW_RULES: (none)"
-  fi
-  echo
-
-  confirm_yn "Save these defaults to ${CREATE_PROFILE_PATH} for future runs?" || { echo "Skipped saving create-profile."; return 0; }
-
-  local tmp
-  tmp="$(mktemp)"
-  {
-    echo "# Generated by create-vm.sh on $(date -Is)"
-    echo "# This file is bash-sourceable. Root-owned (0600)."
-    echo
-    printf 'TIMEZONE=%q\n' "${TIMEZONE}"
-    printf 'LAN_SSH_CIDR=%q\n' "${LAN_SSH_CIDR}"
-    printf 'VPN_SSH_CIDR=%q\n' "${VPN_SSH_CIDR}"
-    printf 'BRIDGE_IF=%q\n' "${BRIDGE_IF}"
-    printf 'OS_VARIANT=%q\n' "${OS_VARIANT}"
-    printf 'UBUNTU_VERSION=%q\n' "${UBUNTU_VERSION}"
-    echo "PUBLIC_ALLOW_RULES=("
-    for p in "${PUBLIC_ALLOW_RULES[@]}"; do
-      printf '  %q\n' "${p}"
-    done
-    echo ")"
-    echo
-  } > "${tmp}"
-
-  sudo install -m 600 -o root -g root "${tmp}" "${CREATE_PROFILE_PATH}"
-  rm -f "${tmp}"
-  echo "OK: saved create-profile to ${CREATE_PROFILE_PATH}"
-}
-
-ensure_required_inputs() {
-  if [[ -z "${TIMEZONE:-}" ]]; then
-    prompt_with_default TIMEZONE "Timezone" "${DEFAULT_TIMEZONE}"
-  fi
-
-  if [[ -z "${LAN_SSH_CIDR:-}" ]]; then
-    while true; do
-      prompt_with_default LAN_SSH_CIDR "LAN subnet allowed for SSH (CIDR)" "${DEFAULT_LAN_SSH_CIDR}"
-      validate_cidr "${LAN_SSH_CIDR}" && break
-      echo "Invalid CIDR. Example: ${DEFAULT_LAN_SSH_CIDR}"
-    done
-  fi
-
-  if [[ -z "${VPN_SSH_CIDR:-}" ]]; then
-    while true; do
-      prompt_with_default VPN_SSH_CIDR "VPN subnet allowed for SSH (CIDR)" "${DEFAULT_VPN_SSH_CIDR}"
-      validate_cidr "${VPN_SSH_CIDR}" && break
-      echo "Invalid CIDR. Example: ${DEFAULT_VPN_SSH_CIDR}"
-    done
-  fi
-}
-
-# ===============================
-# Cleanup helpers
-# ===============================
 safe_rm_rf() {
   local path="$1"
   if [[ -z "${path}" || "${path}" == "/" || "${#path}" -lt 10 ]]; then
     echo "FAIL: refusing to delete suspicious path: '${path}'"
     return 1
   fi
-  if sudo rm -rf -- "${path}"; then
-    echo "OK: deleted ${path}"
-    return 0
-  else
-    echo "FAIL: could not delete ${path}"
-    return 1
-  fi
+  sudo rm -rf -- "${path}" && echo "OK: deleted ${path}" || { echo "FAIL: could not delete ${path}"; return 1; }
 }
 
 cleanup_cloudinit_dir() {
   local dir="$1"
-
-  if [[ "${CLEANUP_VM_CLOUDINIT_DIR}" != "true" ]]; then
-    return 0
-  fi
+  [[ "${CLEANUP_VM_CLOUDINIT_DIR}" == "true" ]] || return 0
 
   if [[ "$dir" != /var/lib/libvirt/boot/*/cloud-init/* ]]; then
     echo "WARN: refusing to clean unexpected cloud-init path: $dir"
     return 0
   fi
-
-  if [[ ! -d "$dir" ]]; then
-    echo "Cloud-init dir not present (nothing to delete): $dir"
-    return 0
-  fi
+  [[ -d "$dir" ]] || { echo "Cloud-init dir not present (nothing to delete): $dir"; return 0; }
 
   echo
   echo "Cleanup candidate (cloud-init artifacts for this VM):"
@@ -271,154 +123,169 @@ cleanup_cloudinit_dir() {
 }
 
 cleanup_old_ubuntu_boot_dirs() {
-  if [[ "${CLEANUP_OLD_UBUNTU_BOOT_DIRS}" != "true" ]]; then
-    return 0
-  fi
+  [[ "${CLEANUP_OLD_UBUNTU_BOOT_DIRS}" == "true" ]] || return 0
 
-  local base="/var/lib/libvirt/boot"
-  local keep="${KEEP_UBUNTU_BOOT_DIRS}"
-
-  mapfile -t dirs < <(sudo find "$base" -maxdepth 1 -type d -name 'ubuntu-*' -printf '%f\n' | sort -V)
+  local base="/var/lib/libvirt/boot" keep="${KEEP_UBUNTU_BOOT_DIRS}"
+  mapfile -t dirs < <(sudo find "$base" -maxdepth 1 -type d -name 'ubuntu-*' -printf '%f\n' 2>/dev/null | sort -V)
   local count="${#dirs[@]}"
 
-  if (( count <= keep )); then
-    echo "No old Ubuntu boot dirs to clean (found $count, keeping $keep)."
-    return 0
-  fi
+  (( count > keep )) || { echo "No old Ubuntu boot dirs to clean (found $count, keeping $keep)."; return 0; }
 
   local to_delete_count=$((count - keep))
   local -a delete_paths=()
-
   for ((i=0; i<to_delete_count; i++)); do
     local d="${dirs[$i]}"
-    local full="${base}/${d}"
-    if [[ "$d" =~ ^ubuntu-[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-      delete_paths+=("$full")
-    fi
+    [[ "$d" =~ ^ubuntu-[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && delete_paths+=( "${base}/${d}" )
   done
-
-  if (( ${#delete_paths[@]} == 0 )); then
-    echo "No matching old Ubuntu boot dirs eligible for deletion."
-    return 0
-  fi
+  (( ${#delete_paths[@]} > 0 )) || { echo "No matching old Ubuntu boot dirs eligible for deletion."; return 0; }
 
   echo
   echo "Cleanup candidates (old Ubuntu boot dirs):"
   echo "Found ${count} ubuntu-* dirs; keeping newest ${keep}; proposing to delete:"
-  for p in "${delete_paths[@]}"; do
-    echo "  - ${p}"
-  done
+  for p in "${delete_paths[@]}"; do echo "  - ${p}"; done
 
   if confirm_yn "Delete these old Ubuntu boot directories now?"; then
     local failures=0
-    for p in "${delete_paths[@]}"; do
-      if ! safe_rm_rf "$p"; then
-        failures=$((failures+1))
-      fi
-    done
-    if (( failures == 0 )); then
-      echo "OK: old Ubuntu boot dir cleanup completed successfully."
-    else
-      echo "WARN: cleanup completed with ${failures} failure(s). See messages above."
-    fi
+    for p in "${delete_paths[@]}"; do safe_rm_rf "$p" || failures=$((failures+1)); done
+    (( failures == 0 )) && echo "OK: old Ubuntu boot dir cleanup completed successfully." || echo "WARN: cleanup completed with ${failures} failure(s)."
   else
     echo "Skipped deleting old Ubuntu boot directories."
   fi
 }
 
-# ===============================
-# Summary
-# ===============================
-show_summary() {
-  echo
-  echo "========== CREATE-VM SUMMARY =========="
-  echo "Host-side settings:"
-  echo "  - Ubuntu version:     ${UBUNTU_VERSION}"
-  echo "  - OS variant:         ${OS_VARIANT}"
-  echo "  - Bridge:             ${BRIDGE_IF}"
-  echo "  - VM RAM:             ${RAM_MB} MB (max ${MAX_RAM_MB} MB)"
-  echo "  - vCPUs:              ${VCPUS} (max ${MAX_VCPUS})"
-  echo "  - Disk:               ${DISK_SIZE_GB} GB"
-  echo
-  echo "Guest baseline settings (cloud-init):"
-  echo "  - Timezone:           ${TIMEZONE}"
-  echo "  - SSH allowlists:"
-  echo "      * LAN: ${LAN_SSH_CIDR}"
-  echo "      * VPN: ${VPN_SSH_CIDR}"
-  if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
-    echo "  - Public ports (Anywhere):"
-    for p in "${PUBLIC_ALLOW_RULES[@]}"; do echo "      * ${p}"; done
+apt_install_prompt() {
+  local pkg="$1"
+  if confirm_yn "Missing dependency. Install '${pkg}' now via apt?"; then
+    sudo apt-get update
+    sudo apt-get install -y "${pkg}"
   else
-    echo "  - Public ports (Anywhere): none"
+    echo "ERROR: required dependency '${pkg}' is missing."
+    exit 1
   fi
+}
+
+ensure_cmd_or_install() {
+  local cmd="$1" pkg="$2"
+  need_cmd "$cmd" || apt_install_prompt "$pkg"
+}
+
+detect_bridges() {
+  if need_cmd bridge; then
+    bridge link 2>/dev/null | awk '{print $4}' | sed 's/@.*//' | sort -u | grep -v '^$' || true
+  else
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sort -u || true
+  fi
+}
+
+ensure_bridge_exists_or_prompt() {
+  local current="$1"
+  if ip link show "$current" >/dev/null 2>&1; then
+    echo "$current"; return 0
+  fi
+
   echo
-  echo "Planned artifacts:"
-  echo "  - VM name:            ${VM_NAME}"
-  echo "  - VM hostname:        ${VM_HOSTNAME}"
-  echo "  - Disk path:          ${DISK_PATH}"
-  echo "  - ISO path:           ${ISO_PATH}"
-  echo "  - Cloud-init seed:    ${CI_SEED_ISO}"
-  echo "======================================="
+  echo "Bridge interface '${current}' not found."
+  echo "Detected interfaces (may include bridges):"
+  detect_bridges | sed 's/^/  - /' || true
   echo
+
+  local chosen=""
+  while true; do
+    prompt_with_default chosen "Bridge interface to attach VM NICs to" "${current}"
+    if ip link show "$chosen" >/dev/null 2>&1; then
+      echo "$chosen"; return 0
+    fi
+    echo "Interface '${chosen}' still not found. Try again."
+  done
+}
+
+verify_iso_sha256() {
+  local iso_path="$1" iso_name="$2" sums_path="$3"
+  sudo awk -v name="$iso_name" -v iso="$iso_path" '
+    $2 ~ ("\\*?" name "$") { print $1 "  " iso }
+  ' "$sums_path" | sha256sum -c -
 }
 
 # ===============================
-# Preflight
+# Safety / sudo
 # ===============================
-need_cmd wget
-need_cmd sha256sum
-need_cmd grep
-need_cmd sudo
-need_cmd virt-install
-need_cmd virsh
-need_cmd openssl
-need_cmd ip
-
 if [[ "$EUID" -eq 0 ]]; then
   echo "Run as a normal user with sudo, not root."
   exit 1
 fi
-
-# Warm up sudo (avoid mid-run prompts)
 sudo -v
 
+# ===============================
+# Dependencies (prompt to install)
+# ===============================
+ensure_cmd_or_install wget wget
+ensure_cmd_or_install sha256sum coreutils
+ensure_cmd_or_install awk gawk
+ensure_cmd_or_install grep grep
+ensure_cmd_or_install ip iproute2
+ensure_cmd_or_install openssl openssl
+ensure_cmd_or_install virt-install virtinst
+ensure_cmd_or_install virsh libvirt-clients
+
 HAVE_CLOUD_LOCALDS=0
-if command -v cloud-localds >/dev/null 2>&1; then
+if need_cmd cloud-localds; then
   HAVE_CLOUD_LOCALDS=1
 else
-  if ! command -v genisoimage >/dev/null 2>&1 && ! command -v mkisofs >/dev/null 2>&1; then
-    echo "ERROR: Need 'cloud-localds' (cloud-image-utils) OR 'genisoimage'/'mkisofs' to build CIDATA seed ISO."
-    exit 1
+  if ! need_cmd genisoimage && ! need_cmd mkisofs; then
+    echo
+    echo "Missing cloud-init seed ISO builder."
+    echo "Recommended: cloud-localds (package: cloud-image-utils)"
+    echo
+    apt_install_prompt cloud-image-utils
+    HAVE_CLOUD_LOCALDS=1
   fi
 fi
-
-if ! ip link show "${BRIDGE_IF}" >/dev/null 2>&1; then
-  echo "ERROR: bridge interface '${BRIDGE_IF}' not found."
-  exit 1
-fi
-
-# Load create-profile (if exists) and prompt missing values
-load_create_profile_if_present
-ensure_required_inputs
-
-# Optional: public ports for this VM (template-friendly)
-prompt_public_ports
-
-# Offer to save create-profile for future runs
-save_create_profile || true
 
 # ===============================
 # Interactive inputs
 # ===============================
-prompt_nonempty VM_NAME "VM name (e.g. vm1, dns-server): "
+prompt_nonempty VM_NAME "VM name (e.g. rustdesk, minecraft): "
 prompt_nonempty ADMIN_USER "Admin username (e.g. admin): "
 prompt_password
 
+prompt_with_default UBUNTU_VERSION "Ubuntu version" "${UBUNTU_VERSION_DEFAULT}"
+prompt_with_default OS_VARIANT "libosinfo os-variant" "${OS_VARIANT_DEFAULT}"
+
+while true; do
+  prompt_with_default LAN_SSH_CIDR "LAN subnet allowed for SSH (CIDR)" "${LAN_SSH_CIDR_DEFAULT}"
+  validate_cidr "${LAN_SSH_CIDR}" && break
+  echo "Invalid CIDR. Example: ${LAN_SSH_CIDR_DEFAULT}"
+done
+while true; do
+  prompt_with_default VPN_SSH_CIDR "VPN subnet allowed for SSH (CIDR)" "${VPN_SSH_CIDR_DEFAULT}"
+  validate_cidr "${VPN_SSH_CIDR}" && break
+  echo "Invalid CIDR. Example: ${VPN_SSH_CIDR_DEFAULT}"
+done
+prompt_with_default TIMEZONE "Timezone" "${TIMEZONE_DEFAULT}"
+
+prompt_with_default RAM_MB "RAM (MB)" "${RAM_MB_DEFAULT}"
+prompt_with_default MAX_RAM_MB "Max RAM (MB)" "${MAX_RAM_MB_DEFAULT}"
+prompt_with_default VCPUS "vCPUs" "${VCPUS_DEFAULT}"
+prompt_with_default MAX_VCPUS "Max vCPUs" "${MAX_VCPUS_DEFAULT}"
+prompt_with_default DISK_SIZE_GB "Disk size (GB)" "${DISK_SIZE_GB_DEFAULT}"
+
+BRIDGE_IF="$(ensure_bridge_exists_or_prompt "${BRIDGE_IF_DEFAULT}")"
 VM_HOSTNAME="${VM_NAME}"
 
-# Hash password (SHA-512 crypt). Avoid storing plaintext beyond this point.
 ADMIN_PASS_HASH="$(printf '%s' "${ADMIN_PASS_PLAIN}" | openssl passwd -6 -stdin)"
 unset ADMIN_PASS_PLAIN
+
+declare -a PUBLIC_ALLOW_RULES=("${PUBLIC_ALLOW_RULES_DEFAULT[@]}")
+echo
+if confirm_yn "Add any public ports to allow from the internet (UFW allow Anywhere)?"; then
+  echo "Enter <port>/<proto> e.g. 25565/tcp, 21116/udp. Blank line to finish."
+  while true; do
+    read -r -p "> " input
+    [[ -z "${input}" ]] && break
+    [[ "${input}" =~ ^[0-9]{1,5}/(tcp|udp)$ ]] || { echo "Invalid format."; continue; }
+    PUBLIC_ALLOW_RULES+=( "${input}" )
+  done
+fi
 
 # ===============================
 # Derived paths/URLs
@@ -428,6 +295,7 @@ ISO_BASE_URL="https://releases.ubuntu.com/${UBUNTU_VERSION}"
 
 ISO_DIR="/var/lib/libvirt/boot/ubuntu-${UBUNTU_VERSION}"
 ISO_PATH="${ISO_DIR}/${ISO_NAME}"
+SHA256SUMS_PATH="${ISO_DIR}/SHA256SUMS"
 
 DISK_PATH="/var/lib/libvirt/images/${VM_NAME}.qcow2"
 
@@ -436,10 +304,6 @@ CI_USER_DATA="${CI_DIR}/user-data"
 CI_META_DATA="${CI_DIR}/meta-data"
 CI_SEED_ISO="${CI_DIR}/seed-cidata.iso"
 
-# Show summary and confirm before doing anything heavy/destructive
-show_summary
-confirm_yn "Proceed to create VM '${VM_NAME}' and generate artifacts?" || { echo "Aborted."; exit 0; }
-
 # ===============================
 # Idempotency checks
 # ===============================
@@ -447,7 +311,6 @@ if vm_exists "${VM_NAME}"; then
   echo "VM '${VM_NAME}' already exists. Nothing to do."
   exit 0
 fi
-
 if [[ -e "${DISK_PATH}" ]]; then
   echo "ERROR: Disk already exists but VM does not: ${DISK_PATH}"
   echo "Refusing to overwrite. Rename/remove the disk or pick a different VM name."
@@ -455,11 +318,44 @@ if [[ -e "${DISK_PATH}" ]]; then
 fi
 
 # ===============================
+# Summary / confirmation gate
+# ===============================
+echo
+echo "================== PLAN SUMMARY =================="
+echo "VM:"
+echo "  Name:        ${VM_NAME}"
+echo "  Hostname:    ${VM_HOSTNAME}"
+echo "  Admin user:  ${ADMIN_USER}"
+echo "Resources:"
+echo "  RAM:         ${RAM_MB} MB (max ${MAX_RAM_MB} MB)"
+echo "  vCPUs:       ${VCPUS} (max ${MAX_VCPUS})"
+echo "  Disk:        ${DISK_SIZE_GB} GB (${DISK_PATH})"
+echo "Networking:"
+echo "  Bridge:      ${BRIDGE_IF}"
+echo "  SSH CIDRs:   LAN ${LAN_SSH_CIDR} | VPN ${VPN_SSH_CIDR}"
+echo "Ubuntu:"
+echo "  Version:     ${UBUNTU_VERSION}"
+echo "  ISO path:    ${ISO_PATH}"
+echo "  os-variant:  ${OS_VARIANT}"
+echo "Cloud-init:"
+echo "  Seed ISO:    ${CI_SEED_ISO}"
+echo "UFW:"
+if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
+  echo "  Public allow:"
+  for p in "${PUBLIC_ALLOW_RULES[@]}"; do echo "    - ${p}"; done
+else
+  echo "  Public allow: (none)"
+fi
+echo "=================================================="
+echo
+
+confirm_yn "Proceed to create VM '${VM_NAME}' and generate artifacts?" || { echo "Aborted."; exit 0; }
+
+# ===============================
 # Download ISO + verify
 # ===============================
 echo "Preparing Ubuntu ${UBUNTU_VERSION} ISO..."
 sudo mkdir -p "${ISO_DIR}"
-sudo chmod 0755 "${ISO_DIR}"
 
 if [[ ! -f "${ISO_PATH}" ]]; then
   echo "Downloading ${ISO_NAME}..."
@@ -469,10 +365,10 @@ else
 fi
 
 echo "Downloading SHA256SUMS..."
-sudo wget -O "${ISO_DIR}/SHA256SUMS" "${ISO_BASE_URL}/SHA256SUMS"
+sudo wget -O "${SHA256SUMS_PATH}" "${ISO_BASE_URL}/SHA256SUMS"
 
 echo "Verifying ISO checksum..."
-sudo grep " ${ISO_NAME}\$" "${ISO_DIR}/SHA256SUMS" | sudo sha256sum -c -
+verify_iso_sha256 "${ISO_PATH}" "${ISO_NAME}" "${SHA256SUMS_PATH}"
 
 # ===============================
 # Create cloud-init seed ISO (CIDATA)
@@ -480,13 +376,10 @@ sudo grep " ${ISO_NAME}\$" "${ISO_DIR}/SHA256SUMS" | sudo sha256sum -c -
 echo "Creating cloud-init NoCloud seed (CIDATA)..."
 sudo mkdir -p "${CI_DIR}"
 
-PUBLIC_ALLOW_JOINED=""
-if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
-  for rule in "${PUBLIC_ALLOW_RULES[@]}"; do
-    PUBLIC_ALLOW_JOINED+="${rule} "
-  done
-  PUBLIC_ALLOW_JOINED="${PUBLIC_ALLOW_JOINED% }"
-fi
+UFW_PUBLIC_BLOCK=""
+for rule in "${PUBLIC_ALLOW_RULES[@]}"; do
+  UFW_PUBLIC_BLOCK+="  - [ ufw, allow, ${rule} ]\n"
+done
 
 sudo tee "${CI_USER_DATA}" >/dev/null <<EOF
 #cloud-config
@@ -511,6 +404,7 @@ packages:
   - ufw
   - qemu-guest-agent
   - unattended-upgrades
+  - openssh-server
 
 runcmd:
   - [ systemctl, enable, --now, "serial-getty@ttyS0.service" ]
@@ -538,8 +432,7 @@ runcmd:
       echo 'UsePAM yes' >> "\$SSHD"
     fi
 
-    (systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || \
-     systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || true)
+    systemctl reload ssh || systemctl restart ssh || systemctl reload sshd || systemctl restart sshd || true
 
   - |
     set -e
@@ -574,15 +467,17 @@ runcmd:
 
     ufw allow from ${LAN_SSH_CIDR} to any port 22 proto tcp
     ufw allow from ${VPN_SSH_CIDR} to any port 22 proto tcp
+EOF
 
-    for rule in ${PUBLIC_ALLOW_JOINED:-}; do
-      ufw allow "\$rule"
-    done
+if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
+  printf "%b" "${UFW_PUBLIC_BLOCK}" | sudo tee -a "${CI_USER_DATA}" >/dev/null
+fi
 
-    ufw logging low
-    ufw --force enable
+sudo tee -a "${CI_USER_DATA}" >/dev/null <<'EOF'
+  - [ ufw, logging, low ]
+  - [ ufw, --force, enable ]
 
-final_message: "cloud-init complete on \$hostname"
+final_message: "cloud-init complete on $hostname"
 EOF
 
 sudo tee "${CI_META_DATA}" >/dev/null <<EOF
@@ -594,31 +489,21 @@ if [[ "${HAVE_CLOUD_LOCALDS}" -eq 1 ]]; then
   sudo cloud-localds -v "${CI_SEED_ISO}" "${CI_USER_DATA}" "${CI_META_DATA}"
 else
   ISO_TOOL="genisoimage"
-  command -v genisoimage >/dev/null 2>&1 || ISO_TOOL="mkisofs"
+  need_cmd genisoimage || ISO_TOOL="mkisofs"
   sudo "${ISO_TOOL}" -output "${CI_SEED_ISO}" -volid CIDATA -joliet -rock "${CI_USER_DATA}" "${CI_META_DATA}"
 fi
 
 # ===============================
-# Create VM (CLI-only, serial console)
+# Create VM
 # ===============================
 echo "Creating VM '${VM_NAME}' (CLI-only, serial console)..."
 
-sudo virt-install \
-  --name "${VM_NAME}" \
-  --os-variant "${OS_VARIANT}" \
-  --memory "${RAM_MB}",maxmemory="${MAX_RAM_MB}" \
-  --vcpus "${VCPUS}",maxvcpus="${MAX_VCPUS}" \
-  --disk path="${DISK_PATH}",size="${DISK_SIZE_GB}",format=qcow2,bus=virtio,discard=unmap \
-  --network bridge="${BRIDGE_IF}",model=virtio \
-  --graphics none \
-  --console pty,target_type=serial \
-  --cdrom "${ISO_PATH}" \
-  --disk path="${CI_SEED_ISO}",device=cdrom,readonly=on
+sudo virt-install   --name "${VM_NAME}"   --os-variant "${OS_VARIANT}"   --memory "${RAM_MB}",maxmemory="${MAX_RAM_MB}"   --vcpus "${VCPUS}",maxvcpus="${MAX_VCPUS}"   --disk path="${DISK_PATH}",size="${DISK_SIZE_GB}",format=qcow2,bus=virtio,discard=unmap   --network bridge="${BRIDGE_IF}",model=virtio   --graphics none   --console pty,target_type=serial   --cdrom "${ISO_PATH}"   --disk path="${CI_SEED_ISO}",device=cdrom,readonly=on
 
 echo "VM '${VM_NAME}' created."
 
 # ===============================
-# Cleanup (after successful VM definition)
+# Cleanup
 # ===============================
 cleanup_cloudinit_dir "${CI_DIR}"
 cleanup_old_ubuntu_boot_dirs
@@ -627,4 +512,8 @@ echo
 echo "Done."
 echo "Install Ubuntu via Cockpit → Machines → ${VM_NAME} → Console (Serial)."
 echo "After first boot, SSH from LAN (${LAN_SSH_CIDR}) or VPN (${VPN_SSH_CIDR}) to the VM as '${ADMIN_USER}'."
-echo "Public ports exposed by UFW in the VM: ${PUBLIC_ALLOW_RULES[*]:-(none)}"
+if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
+  echo "Public ports exposed by UFW in the VM: ${PUBLIC_ALLOW_RULES[*]}"
+else
+  echo "Public ports exposed by UFW in the VM: (none)"
+fi
