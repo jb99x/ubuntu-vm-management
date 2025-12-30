@@ -9,7 +9,11 @@ The format is based on Keep a Changelog, and this project loosely follows Semant
 
 ---
 
-## [Unreleased]
+## [0.2.1]
+
+### Fixed
+- Fixed bridge selection prompting in `create-vm.sh` so only the chosen interface is written to stdout (prevents invalid interface names being passed to `virt-install`).
+- Improved bridge/interface discovery to avoid spurious entries and present a clean list of valid devices.
 
 ---
 
