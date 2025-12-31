@@ -187,7 +187,7 @@ self_update() {
 
 print_version() {
   # Update manually when you cut a release/tag
-  echo "hardening-vm.sh v1.0.2"
+  echo "hardening-vm.sh v1.1.0"
 }
 
 usage() {
