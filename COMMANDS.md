@@ -2,8 +2,8 @@
 
 Practical runbook commands for `ubuntu-vm-management`.
 
-This file is intentionally **generic** (no service-specific VM names). Use placeholders like
-`<vm-name>`, `<admin-user>`, and `<vm-ip>`.
+This file is intentionally **generic** (no service-specific VM names). Use placeholders
+like `<vm-name>`, `<admin-user>`, and `<vm-ip>`.
 
 ---
 
@@ -81,7 +81,7 @@ sudo virsh domifaddr <vm-name>
 ls -lh /var/lib/libvirt/images/
 ```
 
-### Remove a VM disk (example layout)
+### Remove a VM disk (common layout)
 
 ```bash
 sudo rm -f /var/lib/libvirt/images/<vm-name>.qcow2
@@ -156,16 +156,18 @@ sudo git clone https://github.com/<you>/<repo>.git /opt/ubuntu-vm-management
 cd /opt/ubuntu-vm-management
 ```
 
-### Ensure `create-vm.sh` is executable
+### Ensure scripts are executable
 
 ```bash
 sudo chmod 0755 /opt/ubuntu-vm-management/create-vm.sh
+sudo chmod 0755 /opt/ubuntu-vm-management/hardening-vm.sh
 ```
 
-### Install `create-vm` into PATH
+### Install script entrypoints into PATH
 
 ```bash
 sudo ln -sf /opt/ubuntu-vm-management/create-vm.sh /usr/local/sbin/create-vm
+sudo ln -sf /opt/ubuntu-vm-management/hardening-vm.sh /usr/local/sbin/hardening-vm
 ```
 
 ### Fix Git “dubious ownership” warning (if you see it)
@@ -180,22 +182,6 @@ git config --global --add safe.directory /opt/ubuntu-vm-management
 git stash -k
 git pull
 git stash pop
-```
-
----
-
-## Networking & VPN (debug helpers)
-
-### Check listening SSH ports on host
-
-```bash
-sudo ss -tlnp | grep sshd
-```
-
-### Check routing on macOS (VPN debugging)
-
-```bash
-netstat -rn | grep 192.168
 ```
 
 ---

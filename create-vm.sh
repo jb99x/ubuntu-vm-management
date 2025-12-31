@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 set -euo pipefail
 
 # ==============================================================================
 # create-vm.sh — Create an Ubuntu Server VM (libvirt/virt-install) with cloud-init
 #
-# v0.4.1: Fix DHCP + guest-agent reliability for bridged networks.
-#         - network-config matches the VM NIC by MAC (no more eth0/ens* guessing)
-#         - ensure qemu-guest-agent is installed + started (runcmd safety net)
-#         - safer cloud-init seed cleanup (default is to keep until you confirm)
-#         - improved IP discovery attempts + clearer “bridged network” guidance
+# v1.0.0: Adds post-create checks (domain, guest-agent, cloud-init, SSH).
+#         Keeps existing safe defaults; improves success visibility.
 # ==============================================================================
 
 # -------------------------------
@@ -38,6 +36,9 @@ DISK_MODE_DEFAULT="overlay"                 # overlay|copy
 FORCE_DHCP_NETCFG_DEFAULT="on"              # on|off
 WAIT_FOR_IP_DEFAULT="on"                    # on|off
 WAIT_FOR_IP_TIMEOUT_DEFAULT="180"           # seconds
+
+POSTCHECK_MODE_DEFAULT="on"               # on|off
+POSTCHECK_TIMEOUT_DEFAULT="240"           # seconds
 
 CREATE_PROFILE_PATH="/etc/create-vm-profile.conf"
 LOG_DIR_DEFAULT="/var/log/create-vm"
@@ -296,6 +297,154 @@ wait_for_ip() {
   return 0
 }
 
+extract_first_ipv4() {
+  # Reads from stdin, prints first IPv4 match (no CIDR), or blank.
+  grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' | head -n1 | cut -d/ -f1 || true
+}
+
+discover_vm_ip() {
+  local vm="$1"
+  local out=""
+  out="$(sudo virsh domifaddr "$vm" --source agent 2>/dev/null || true)"
+  echo "$out" | extract_first_ipv4 && return 0
+  out="$(sudo virsh domifaddr "$vm" --source lease 2>/dev/null || true)"
+  echo "$out" | extract_first_ipv4 && return 0
+  out="$(sudo virsh domifaddr "$vm" --source arp 2>/dev/null || true)"
+  echo "$out" | extract_first_ipv4 && return 0
+  out="$(sudo virsh domifaddr "$vm" 2>/dev/null || true)"
+  echo "$out" | extract_first_ipv4 && return 0
+  return 1
+}
+
+wait_for_qemu_agent() {
+  local vm="$1" timeout="$2"
+  local end=$(( $(date +%s) + timeout ))
+  while (( $(date +%s) < end )); do
+    if sudo virsh qemu-agent-command "$vm" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+guest_exec_and_print() {
+  # Best-effort: runs a command inside the guest via qemu-guest-agent guest-exec,
+  # prints stdout/stderr (decoded) if possible.
+  #
+  # Requires python3 on the host; if unavailable, we still run but do not decode output.
+  local vm="$1"; shift
+  local cmd="$1"; shift
+  local args_json
+  args_json="$(python3 - <<PY
+import json,sys
+cmd=sys.argv[1]
+args=sys.argv[2:]
+print(json.dumps({"execute":"guest-exec","arguments":{"path":cmd,"arg":args,"capture-output":True}}))
+PY
+"$cmd" "$@")" || return 1
+
+  local resp pid
+  resp="$(sudo virsh qemu-agent-command "$vm" "$args_json" 2>/dev/null || true)"
+  pid="$(python3 - <<'PY'
+import json,sys
+s=sys.stdin.read().strip()
+try:
+  j=json.loads(s)
+  print(j.get("return",{}).get("pid",""))
+except Exception:
+  print("")
+PY
+<<<"$resp")"
+
+  [[ -n "$pid" ]] || { echo "WARN: guest-exec did not return a pid (agent may restrict exec)."; return 1; }
+
+  local end=$(( $(date +%s) + 120 ))
+  while (( $(date +%s) < end )); do
+    local st
+    st="$(sudo virsh qemu-agent-command "$vm" "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${pid}}}" 2>/dev/null || true)"
+    local exited
+    exited="$(python3 - <<'PY'
+import json,sys
+s=sys.stdin.read().strip()
+try:
+  j=json.loads(s).get("return",{})
+  print("1" if j.get("exited") else "0")
+except Exception:
+  print("0")
+PY
+<<<"$st")"
+    if [[ "$exited" == "1" ]]; then
+      python3 - <<'PY'
+import json,sys,base64
+s=sys.stdin.read()
+try:
+  r=json.loads(s).get("return",{})
+  out=r.get("out-data","")
+  err=r.get("err-data","")
+  if out:
+    try: print(base64.b64decode(out).decode("utf-8","replace"),end="")
+    except Exception: print(out)
+  if err:
+    try: print(base64.b64decode(err).decode("utf-8","replace"),end="")
+    except Exception: print(err)
+except Exception:
+  pass
+PY
+<<<"$st" || true
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "WARN: guest-exec timed out waiting for command completion."
+  return 1
+}
+
+post_create_checks() {
+  local vm="$1" timeout="$2"
+  echo
+  echo "== Post-create checks =="
+
+  local state
+  state="$(sudo virsh domstate "$vm" 2>/dev/null | tr -d '\r' | head -n1 || true)"
+  echo "- domstate: ${state:-unknown}"
+  if [[ "$state" != "running" ]]; then
+    echo "WARN: VM is not in 'running' state. Post-checks may be incomplete."
+  fi
+
+  local ip=""
+  ip="$(discover_vm_ip "$vm" || true)"
+  if [[ -n "$ip" ]]; then
+    echo "- discovered IPv4: ${ip}"
+    # Check if SSH port is reachable from host network.
+    if timeout 2 bash -c "cat < /dev/null > /dev/tcp/${ip}/22" >/dev/null 2>&1; then
+      echo "- ssh port 22: reachable"
+    else
+      echo "- ssh port 22: not reachable (yet)"
+    fi
+  else
+    echo "- discovered IPv4: (none)"
+  fi
+
+  if wait_for_qemu_agent "$vm" "$timeout"; then
+    echo "- qemu-guest-agent: responsive"
+
+    echo
+    echo "Guest status (via qemu-guest-agent):"
+    guest_exec_and_print "$vm" /bin/bash -lc \
+      "set -e; echo 'cloud-init:'; (cloud-init status --wait 2>/dev/null || cloud-init status 2>/dev/null || true); \
+       echo 'services:'; systemctl is-active ssh 2>/dev/null || true; systemctl is-active systemd-networkd 2>/dev/null || true; \
+       systemctl is-active qemu-guest-agent 2>/dev/null || true; \
+       echo 'network:'; ip -4 addr show || true; ip -4 route show || true" || true
+  else
+    echo "- qemu-guest-agent: not responding within ${timeout}s"
+    echo "  (This is common if the agent package isn't installed yet, cloud-init is still running, or networking hasn't settled.)"
+  fi
+
+  echo "== Post-create checks complete =="
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -433,7 +582,8 @@ BRIDGE_IF="$(ensure_iface_exists_or_prompt "${BRIDGE_IF_DEFAULT}")"
 prompt_with_default DISK_MODE "Disk mode (overlay|copy)" "${DISK_MODE_DEFAULT}"
 prompt_with_default FORCE_DHCP_NETCFG "Force DHCP network-config (on|off)" "${FORCE_DHCP_NETCFG_DEFAULT}"
 prompt_with_default WAIT_FOR_IP_MODE "Wait for IP after start (on|off)" "${WAIT_FOR_IP_DEFAULT}"
-prompt_with_default WAIT_FOR_IP_TIMEOUT "Wait for IP timeout (seconds)" "${WAIT_FOR_IP_TIMEOUT_DEFAULT}"
+prompt_with_default WAIT_FOR_IP_TIMEOUT "Wait for IP timeout \(seconds\)" "\$\{WAIT_FOR_IP_TIMEOUT_DEFAULT\}"prompt_with_default POSTCHECK_MODE "Post-create checks (on|off)" "${POSTCHECK_MODE_DEFAULT}"
+prompt_with_default POSTCHECK_TIMEOUT "Post-create checks timeout (seconds)" "${POSTCHECK_TIMEOUT_DEFAULT}"
 
 prompt_with_default VNC_MODE "VNC console (off|on)" "${VNC_DEFAULT}"
 prompt_with_default VNC_LISTEN "VNC listen address" "${VNC_LISTEN_DEFAULT}"
@@ -713,6 +863,10 @@ echo "VM '${VM_NAME}' created and started."
 
 if [[ "${WAIT_FOR_IP_MODE}" == "on" ]]; then
   wait_for_ip "${VM_NAME}" "${WAIT_FOR_IP_TIMEOUT}" || true
+fi
+
+if [[ "${POSTCHECK_MODE}" == "on" ]]; then
+  post_create_checks "${VM_NAME}" "${POSTCHECK_TIMEOUT}" || true
 fi
 
 cleanup_cloudinit_dir "${CI_DIR}"

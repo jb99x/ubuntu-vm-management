@@ -1,23 +1,21 @@
-# VM Creation & Hardening Toolkit
+# Ubuntu VM Management
 
-This repository contains two complementary scripts used to create and secure Linux virtual machines in a consistent, repeatable way.
+A small toolkit for **creating** Ubuntu VMs with a secure baseline and **hardening**
+existing Ubuntu VMs to the same standard.
 
-The design goals are:
+The project is intentionally:
 
-- Create new VMs with a secure baseline from first boot
-- Harden existing VMs to the same standard
-- Avoid hidden assumptions, hardcoded environment details, or unsafe automation
+- **Generic** (no environment-specific assumptions baked in)
+- **Repeatable** (optional root-owned profiles)
+- **Safe** (preflight summaries + confirmation gates)
+- **Boring** (predictable defaults, no hidden side effects)
 
----
+## Contents
 
-## Overview
-
-| Script | Purpose | When to use |
-|------|--------|------------|
-| `create-vm.sh` | Create a new Ubuntu VM with a secure baseline using cloud-init | **Before first boot** |
-| `hardening-vm.sh` | Apply or re-apply security baseline to an existing VM | **After install / on legacy VMs** |
-
-The two scripts share the same philosophy and configuration model but operate at different lifecycle stages.
+- `create-vm.sh` — unattended Ubuntu VM creation using Canonical cloud images
+- `hardening-vm.sh` — idempotent hardening for existing Ubuntu VMs
+- `COMMANDS.md` — operational runbook / quick-reference
+- `CHANGELOG.md` — project history
 
 ---
 
@@ -25,48 +23,51 @@ The two scripts share the same philosophy and configuration model but operate at
 
 ### What it does
 
-- Downloads and verifies the requested Ubuntu Server ISO
-- Creates a VM using `virt-install` (CLI-only, serial console)
-- Generates a cloud-init seed that:
+- Downloads and verifies an Ubuntu **cloud image** (by codename + flavor)
+- Creates VM disks in either:
+  - `overlay` mode (fast, space-efficient), or
+  - `copy` mode (fully independent image)
+- Generates a cloud-init NoCloud seed ISO that:
   - creates an admin user (password-based SSH)
-  - disables root login
-  - enables serial console
-  - enables `qemu-guest-agent`
-  - configures SSH securely
+  - disables root SSH login
   - configures UFW:
     - SSH allowed **only** from LAN/VPN CIDRs
     - optional public service ports (open to Anywhere)
-- Provides a full summary and confirmation **before** creating anything
-- Optionally cleans up:
-  - per-VM cloud-init artifacts
-  - old Ubuntu ISO directories
+  - enables serial console
+  - enables `qemu-guest-agent` (where available)
+- Provides a full **plan summary** + confirmation before creating anything
+- Writes a per-run log file under `/var/log/create-vm` (configurable)
+- Optional post-create checks (best-effort):
+  - VM state
+  - IP discovery (may not work on bridged networks)
+  - SSH reachability from host (best-effort)
+  - guest-side cloud-init / service status when agent/SSH allows
 
-### Configuration model
+### Profiles
 
-- Uses **generic defaults only** (safe for any environment)
-- Prompts for required values if missing
-- Can load/save a **root-owned profile**:
+`create-vm.sh` can load/save a root-owned profile:
 
-```
-/etc/create-vm-profile.conf
-```
+- `/etc/create-vm-profile.conf`
 
-This allows consistent reuse of:
+Typical items that can be stored:
+
 - timezone
 - LAN/VPN SSH CIDRs
 - bridge interface
-- public ports
-- Ubuntu version and OS variant
+- codename/flavor defaults
+- post-check toggles / timeouts
+
+> Profiles are **not** intended to be committed to git.
 
 ### When to use
 
 Use `create-vm.sh` when:
 
-- building a **new VM**
-- you want security applied **from first boot**
-- you want no GUI / no VNC / serial + SSH only
+- you want a secure baseline from first boot
+- you want an unattended install path (cloud-image import)
+- you want a CLI-friendly VM (serial + SSH), with optional VNC if needed
 
-Do **not** use it on existing VMs.
+Do **not** use it for retrofitting existing installations.
 
 ---
 
@@ -74,82 +75,57 @@ Do **not** use it on existing VMs.
 
 ### What it does
 
-- Applies the same security baseline to an **existing VM**
-- Detects and optionally imports existing UFW public rules
-- Resets and re-applies firewall rules safely
-- Disables root SSH login and enables password authentication
-- Ensures serial console and QEMU guest agent are enabled
-- Performs **APT repair tasks** if needed:
-  - detects malformed sources
-  - optionally converts legacy sources to Deb822
-  - removes “Missing Signed-By” warnings
-- Provides a detailed preflight summary and confirmation gate
+- Applies the baseline to an **existing** Ubuntu VM
+- Safe, repeatable UFW policy:
+  - resets firewall rules (with preflight + warnings)
+  - re-applies SSH allowlists (LAN/VPN CIDRs)
+  - optionally imports existing public allow rules
+- SSH policy:
+  - disables root SSH login
+  - enables password authentication
+- Ensures serial console and QEMU guest agent are enabled where supported
+- APT repair helpers (optional), including:
+  - detect malformed source files and offer to disable them
+  - optionally migrate Ubuntu sources to Deb822 with `Signed-By`
+  - reduce “Missing Signed-By” warnings
 
-### Configuration model
+### Profiles
 
-- Loads/saves a **root-owned profile**:
+`hardening-vm.sh` can load/save a root-owned profile:
 
-```
-/etc/hardening-profile.conf
-```
-
-- Prompts for missing values using generic defaults
-- Never assumes environment-specific CIDRs
-
-### When to use
-
-Use `hardening-vm.sh` when:
-
-- hardening a **legacy VM**
-- re-applying the baseline after manual changes
-- repairing broken APT sources
-- standardising firewall and SSH configuration
-
-The script is safe to re-run and is designed to be idempotent.
+- `/etc/hardening-profile.conf`
 
 ---
 
-## Relationship Between the Scripts
+## Recommended filesystem layout
 
-- `create-vm.sh` applies the baseline early via cloud-init
-- `hardening-vm.sh` enforces the same baseline later, if needed
-- Not all logic is shared:
-  - APT source repair belongs **only** in hardening
-  - VM creation logic belongs **only** in create-vm
-
-The scripts are aligned by design, not duplicated.
+```text
+/opt/ubuntu-vm-management/              # git checkout
+/usr/local/sbin/create-vm               # symlink to create-vm.sh
+/usr/local/sbin/hardening-vm            # symlink to hardening-vm.sh
+/etc/create-vm-profile.conf             # local-only (not in git)
+/etc/hardening-profile.conf             # local-only (not in git)
+```
 
 ---
 
-## Security Model (Intentional Choices)
+## Install (host)
 
-- SSH is password-based and restricted to LAN/VPN CIDRs
+See `COMMANDS.md`.
+
+---
+
+## Security model (intentional choices)
+
+- Password-based SSH is allowed, but restricted to LAN/VPN CIDRs
 - Root login is disabled
-- No VNC, SPICE, or GUI access
-- Serial console + SSH only
-- Firewall defaults to deny incoming
+- Default-deny inbound firewall policy (UFW)
 - Public services must be explicitly declared
+- Serial console is enabled for recovery
+- Optional VNC can be enabled at creation time for troubleshooting
 
 ---
 
-## Filesystem Layout (Recommended)
+## License
 
-```
-/usr/local/sbin/create-vm.sh
-/usr/local/sbin/hardening-vm.sh
-
-/etc/create-vm-profile.conf
-/etc/hardening-profile.conf
-```
-
----
-
-## Philosophy
-
-- No `curl | bash`
-- No silent destructive actions
-- No environment-specific assumptions
-- Everything visible before it happens
-- Everything repeatable later
-
-These scripts are meant to be **boring, predictable, and safe**.
+MIT — see `LICENSE`.

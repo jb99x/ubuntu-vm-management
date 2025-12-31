@@ -2,11 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on Keep a Changelog, and this project loosely follows Semantic Versioning.
+The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project loosely follows [Semantic Versioning](https://semver.org/).
 
 - MAJOR: breaking changes or redesigns
 - MINOR: new features, safer defaults, improved UX
 - PATCH: bug fixes only
+
+---
+
+## [1.0.0]
+
+### Added
+
+- Fully unattended VM creation using Ubuntu cloud images
+- Disk overlay and copy modes
+- Optional VNC console
+- Post-create validation checks
+- Per-run logging
+- COMMANDS.md runbook
+- MIT license
+
+### Changed
+
+- ISO installs replaced by cloud-image imports
+- DHCP networking via systemd-networkd
+
+### Security
+
+- Root SSH login disabled
+- SSH restricted to LAN/VPN CIDRs
+- Default-deny inbound firewall policy
 
 ---
 
@@ -34,13 +59,13 @@ The format is based on Keep a Changelog, and this project loosely follows Semant
 - Optional NoCloud `network-config` generation to force DHCP on first boot (helps avoid “VM has no IP” edge cases).
 - Run logging: each invocation logs to `/var/log/create-vm/<vm>-<timestamp>.log` for troubleshooting and auditability.
 - Post-create IP wait: optional polling of `virsh domifaddr` to surface the VM IP after creation.
-- `--destroy <name>` mode: stop + undefine the VM and remove best-effort associated artifacts (disk + seed dirs) with confirmation.
+- `--destroy <vm>` mode: stop + undefine the VM and remove best-effort associated artifacts (disk + seed dirs) with confirmation.
 - Host preflight sanity check to confirm libvirt is reachable before proceeding.
 
 ### Changed
 
 - Cloud-init now includes `growpart`/`resize_rootfs` so resized disks expand automatically on first boot.
-- Boot-dir cleanup now targets only `ubuntu-<codename>-(standard|minimal)` directories defensively.
+- Boot-dir cleanup now targets only `ubuntu-*-standard|minimal` directories defensively.
 
 ---
 
@@ -50,13 +75,13 @@ The format is based on Keep a Changelog, and this project loosely follows Semant
 
 - Unattended VM provisioning using Ubuntu cloud images (`virt-install --import`) instead of interactive ISO installs (standard or minimal image flavor).
 - Optional VNC console toggle during VM creation (default remains off; serial console/SSH remain primary).
-- Dependency prompts for missing tooling (e.g., `cloud-image-utils` / `cloud-localds`, `qemu-img`).
+- Dependency prompts for missing tooling (e.g. `cloud-image-utils` / `cloud-localds`, `qemu-img`).
 
 ### Changed
 
 - Download verification now uses SHA256SUMS entries in a robust way (supports `*filename` format), fixing “no properly formatted checksum lines found”.
 - Bridge/interface selection is now safe to capture (no multi-line output captured into `--network`).
-- Boot artifacts are stored under a codename+flavor path (e.g., `/var/lib/libvirt/boot/ubuntu-noble-standard/`) to avoid collisions.
+- Boot artifacts are stored under a codename+flavor path (e.g. `/var/lib/libvirt/boot/ubuntu-noble-standard/`) to avoid collisions.
 
 ### Fixed
 
@@ -80,14 +105,12 @@ The format is based on Keep a Changelog, and this project loosely follows Semant
 
 - Interactive dependency checks in `create-vm.sh` with optional installation prompts for required tooling.
 - Automatic detection of available network bridges with interactive selection if the configured bridge is not found.
-- Preflight plan summary in `create-vm.sh` showing VM resources, networking, ISO paths, and firewall intent before execution.
-- Robust ISO checksum verification compatible with Ubuntu `SHA256SUMS` formats.
+- Preflight plan summary in `create-vm.sh` showing VM resources, networking, artifacts, and firewall intent before execution.
 
 ### Changed
 
-- `create-vm.sh` now always prompts for SSH CIDRs with generic defaults instead of embedding environment-specific values.
+- `create-vm.sh` prompts for SSH CIDRs with generic defaults instead of embedding environment-specific values.
 - Bridge interface is no longer assumed to be `br0`; user confirmation is required when the default is unavailable.
-- Improved error handling and messaging for missing cloud-init seed generation tools.
 - Clearer separation of host responsibilities (VM creation) and guest responsibilities (hardening).
 
 ### Fixed
