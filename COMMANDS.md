@@ -192,3 +192,14 @@ git stash pop
   Check your router / UniFi DHCP leases using the VM MAC address.
 - Keep cloud-init seed directories until first boot is confirmed, unless you’re sure the VM
   has completed cloud-init successfully.
+
+## Install / update hardening inside a VM (no git)
+
+```bash
+sudo wget -O /usr/local/sbin/hardening-vm \
+  https://raw.githubusercontent.com/<you>/<repo>/main/hardening-vm.sh
+sudo chmod 0755 /usr/local/sbin/hardening-vm
+
+# update later
+hardening-vm --self-update
+```

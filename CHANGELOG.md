@@ -10,6 +10,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [1.1.0]
+
+### Added
+
+- `hardening-vm.sh --self-update` to fetch and install the latest hardening script from a URL (optional URL override and SHA256 pinning).
+
+### Security
+
+- Ensures unattended security updates are enabled (`unattended-upgrades`, apt timers, and `/etc/apt/apt.conf.d/20auto-upgrades`).
+
+---
+
 ## [1.0.0]
 
 ### Added

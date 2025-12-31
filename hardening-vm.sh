@@ -2,9 +2,23 @@
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
-# ===============================
-# Defaults (shown as fallback prompts)
-# ===============================
+# ==============================================================================
+# hardening-vm.sh
+# - Generic baseline hardening for existing Ubuntu VMs
+# - Safe-by-default: preflight summary + confirmation gates
+# - Optional root-owned profile at /etc/hardening-profile.conf
+#
+# Self-update (wget-based; no git required inside VMs):
+#   hardening-vm --self-update
+#   hardening-vm --self-update --url <raw-url> [--sha256 <expected>]
+#
+# NOTE: This script intentionally stores NO default upstream URL.
+#       If you want self-update, set UPSTREAM_URL in the profile, or pass --url.
+# ==============================================================================
+
+# -------------------------------
+# Defaults (fallback prompts only)
+# -------------------------------
 DEFAULT_LAN_SSH_CIDR="192.168.1.0/24"
 DEFAULT_VPN_SSH_CIDR="192.168.254.0/24"
 DEFAULT_TIMEZONE="Europe/London"
@@ -12,17 +26,29 @@ DEFAULT_TIMEZONE="Europe/London"
 OFFER_APT_SOURCES_CLEANUP=true
 PROFILE_PATH="/etc/hardening-profile.conf"
 
-# ===============================
-# Effective config (may be overridden by profile; may be prompted)
-# ===============================
+# -------------------------------
+# Effective config (profile/prompt)
+# -------------------------------
 TIMEZONE=""
 LAN_SSH_CIDR=""
 VPN_SSH_CIDR=""
 declare -a PUBLIC_ALLOW_RULES=()
 
-# ===============================
+# Self-update settings (profile/CLI; no baked-in default)
+UPSTREAM_URL=""
+UPSTREAM_SHA256=""
+
+# -------------------------------
+# SSH hardening (generic, compatible with password auth)
+# -------------------------------
+SSHD_MAX_AUTH_TRIES="4"
+SSHD_LOGIN_GRACE_TIME="30s"
+SSHD_CLIENT_ALIVE_INTERVAL="300"
+SSHD_CLIENT_ALIVE_COUNT_MAX="2"
+
+# ==============================================================================
 # Helpers
-# ===============================
+# ==============================================================================
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing required command: $1"; exit 1; }; }
 
 confirm_yn() {
@@ -64,6 +90,30 @@ prompt_with_default() {
   fi
 }
 
+prompt_nonempty() {
+  local varname="$1"
+  local prompt="$2"
+  local current="${3:-}"
+  local value=""
+  while true; do
+    if [[ -n "${current}" ]]; then
+      read -r -p "${prompt} [${current}]: " value
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      [[ -z "${value}" ]] && value="${current}"
+    else
+      read -r -p "${prompt}: " value
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+    fi
+    if [[ -n "${value}" ]]; then
+      printf -v "${varname}" '%s' "${value}"
+      return 0
+    fi
+    echo "Value cannot be empty."
+  done
+}
+
 validate_cidr() {
   local cidr="$1"
   [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]
@@ -72,9 +122,95 @@ validate_cidr() {
 array_contains() { local n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 array_add_unique() { local v="$1"; array_contains "$v" "${PUBLIC_ALLOW_RULES[@]}" || PUBLIC_ALLOW_RULES+=( "$v" ); }
 
-# ===============================
+warn() { echo "WARN: $*" >&2; }
+info() { echo "INFO: $*"; }
+
+# ==============================================================================
+# Self-update / install helpers (wget-based; no git required)
+# ==============================================================================
+sha256_of_file() {
+  local f="$1"
+  sha256sum "$f" | awk '{print $1}'
+}
+
+self_update() {
+  local url="${1:-}"
+  local expected="${2:-}"
+  local tmp
+  tmp="$(mktemp)"
+
+  if [[ -z "${url}" ]]; then
+    echo "No UPSTREAM_URL configured."
+    echo "You can either:"
+    echo "  - pass --url <raw-url>, or"
+    echo "  - save UPSTREAM_URL into ${PROFILE_PATH}"
+    echo
+    prompt_nonempty url "Enter upstream raw URL for hardening-vm.sh"
+  fi
+
+  info "Downloading upstream script..."
+  info "  URL: ${url}"
+  need_cmd wget
+
+  wget -qO "$tmp" "$url" || { echo "ERROR: failed to download: $url"; rm -f "$tmp"; exit 1; }
+  chmod 0644 "$tmp"
+
+  local got
+  got="$(sha256_of_file "$tmp")"
+  echo
+  echo "Upstream info:"
+  echo "  URL:  ${url}"
+  echo "  SHA256 (downloaded): ${got}"
+  if [[ -n "$expected" ]]; then
+    echo "  SHA256 (expected):   ${expected}"
+    if [[ "$got" != "$expected" ]]; then
+      echo "ERROR: checksum mismatch; refusing to install."
+      rm -f "$tmp"
+      exit 1
+    fi
+  fi
+
+  echo
+  echo "Install destination:"
+  local dest="/usr/local/sbin/hardening-vm"
+  echo "  ${dest}"
+  echo
+  echo "This will overwrite the existing installed copy (if any)."
+  confirm_yn "Proceed with install/update?" || { echo "Aborted."; rm -f "$tmp"; exit 0; }
+
+  sudo install -m 0755 -o root -g root "$tmp" "$dest"
+  rm -f "$tmp"
+  echo "OK: installed ${dest}"
+  echo "Tip: run 'hardening-vm --version' to confirm."
+  exit 0
+}
+
+print_version() {
+  # Update manually when you cut a release/tag
+  echo "hardening-vm.sh v1.0.2"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  hardening-vm [--self-update] [--url <raw-url>] [--sha256 <expected>] [--version] [--help]
+
+Normal run (interactive):
+  hardening-vm
+
+Self-update (download via wget, install to /usr/local/sbin/hardening-vm):
+  hardening-vm --self-update
+  hardening-vm --self-update --url <raw-url> [--sha256 <expected>]
+
+Notes:
+  - This script stores NO default upstream URL.
+  - For repeatable self-update, save UPSTREAM_URL in /etc/hardening-profile.conf
+EOF
+}
+
+# ==============================================================================
 # Profile
-# ===============================
+# ==============================================================================
 load_profile_if_present() {
   if [[ -f "${PROFILE_PATH}" ]]; then
     echo "Profile detected: ${PROFILE_PATH}"
@@ -97,7 +233,6 @@ load_profile_if_present() {
   if ! declare -p PUBLIC_ALLOW_RULES >/dev/null 2>&1; then
     declare -a PUBLIC_ALLOW_RULES=()
   else
-    # If it exists but isn't an array, convert safely
     if ! declare -p PUBLIC_ALLOW_RULES | grep -q 'declare \-a'; then
       local tmpv="${PUBLIC_ALLOW_RULES:-}"
       unset PUBLIC_ALLOW_RULES
@@ -135,6 +270,11 @@ save_profile() {
   echo "  TIMEZONE=${TIMEZONE}"
   echo "  LAN_SSH_CIDR=${LAN_SSH_CIDR}"
   echo "  VPN_SSH_CIDR=${VPN_SSH_CIDR}"
+  if [[ -n "${UPSTREAM_URL:-}" ]]; then
+    echo "  UPSTREAM_URL=${UPSTREAM_URL}"
+  else
+    echo "  UPSTREAM_URL=(not set)"
+  fi
   if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
     echo "  PUBLIC_ALLOW_RULES:"
     for p in "${PUBLIC_ALLOW_RULES[@]}"; do echo "    - ${p}"; done
@@ -154,6 +294,10 @@ save_profile() {
     printf 'TIMEZONE=%q\n' "${TIMEZONE}"
     printf 'LAN_SSH_CIDR=%q\n' "${LAN_SSH_CIDR}"
     printf 'VPN_SSH_CIDR=%q\n' "${VPN_SSH_CIDR}"
+    # Optional, for self-update
+    if [[ -n "${UPSTREAM_URL:-}" ]]; then
+      printf 'UPSTREAM_URL=%q\n' "${UPSTREAM_URL}"
+    fi
     echo "PUBLIC_ALLOW_RULES=("
     for p in "${PUBLIC_ALLOW_RULES[@]}"; do
       printf '  %q\n' "${p}"
@@ -167,9 +311,9 @@ save_profile() {
   echo "OK: saved profile to ${PROFILE_PATH}"
 }
 
-# ===============================
-# UFW discovery / prompts (robust)
-# ===============================
+# ==============================================================================
+# UFW discovery / prompts
+# ==============================================================================
 detect_ufw_public_ports() {
   command -v ufw >/dev/null 2>&1 || return 0
 
@@ -232,12 +376,12 @@ prompt_additional_public_ports() {
   fi
 }
 
-# ===============================
+# ==============================================================================
 # APT helpers
-# ===============================
+# ==============================================================================
 disable_repo_file() {
   local f="$1"
-  [[ -f "$f" ]] || { echo "WARN: not found: $f"; return 0; }
+  [[ -f "$f" ]] || { warn "not found: $f"; return 0; }
   local new="${f}.disabled.$(date +%Y%m%d-%H%M%S)"
   echo "Disabling repo file: $f -> $new"
   sudo mv "$f" "$new"
@@ -334,10 +478,10 @@ clean_up_apt_sources() {
 
   local codename
   codename="$(detect_ubuntu_codename)"
-  [[ -n "$codename" ]] || { echo "WARN: cannot detect codename; skipping APT cleanup."; return 0; }
+  [[ -n "$codename" ]] || { warn "cannot detect codename; skipping APT cleanup."; return 0; }
 
   echo
-  echo "APT cleanup available (remove 'Missing Signed-By' warnings):"
+  echo "APT cleanup available (reduce 'Missing Signed-By' warnings):"
   echo "  - create /etc/apt/sources.list.d/ubuntu.sources (Deb822 + Signed-By)"
   echo "  - comment Ubuntu lines in /etc/apt/sources.list"
   confirm_yn "Apply this cleanup now?" || { echo "Skipped APT cleanup."; return 0; }
@@ -347,36 +491,63 @@ clean_up_apt_sources() {
   sudo apt-get update
 }
 
-# ===============================
+# ==============================================================================
 # Service helpers
-# ===============================
+# ==============================================================================
 reload_ssh_service() {
+  # Ubuntu typically uses ssh.service, not sshd.service
   if systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.service'; then
     sudo systemctl reload ssh || sudo systemctl restart ssh
   elif systemctl list-unit-files 2>/dev/null | grep -qE '^sshd\.service'; then
     sudo systemctl reload sshd || sudo systemctl restart sshd
-  elif systemctl list-units --all 2>/dev/null | grep -qE '^ssh\.service'; then
-    sudo systemctl reload ssh || sudo systemctl restart ssh
-  elif systemctl list-units --all 2>/dev/null | grep -qE '^sshd\.service'; then
-    sudo systemctl reload sshd || sudo systemctl restart sshd
-  elif [[ -f /lib/systemd/system/ssh.service || -f /usr/lib/systemd/system/ssh.service ]]; then
-    sudo systemctl reload ssh || sudo systemctl restart ssh
-  elif [[ -f /lib/systemd/system/sshd.service || -f /usr/lib/systemd/system/sshd.service ]]; then
-    sudo systemctl reload sshd || sudo systemctl restart sshd
   else
-    echo "WARN: neither ssh.service nor sshd.service found; reload skipped"
+    warn "neither ssh.service nor sshd.service found; reload skipped"
   fi
 }
 
-start_qemu_guest_agent() {
-  sudo systemctl start qemu-guest-agent.service || true
-  sudo systemctl enable qemu-guest-agent.service 2>/dev/null || true
-  sudo systemctl --no-pager --full status qemu-guest-agent.service || true
+ensure_qemu_guest_agent() {
+  sudo apt-get update -y >/dev/null 2>&1 || true
+  sudo apt-get install -y qemu-guest-agent >/dev/null 2>&1 || true
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^qemu-guest-agent\.service'; then
+    sudo systemctl start qemu-guest-agent.service || true
+    # often "static"; enabling may warn - that's OK
+    sudo systemctl enable qemu-guest-agent.service 2>/dev/null || true
+    sudo systemctl --no-pager --full status qemu-guest-agent.service || true
+  else
+    warn "qemu-guest-agent.service not found (may not be available on this image)"
+  fi
 }
 
-# ===============================
+enable_unattended_security_updates() {
+  # Install + enable canonical timers (idempotent)
+  sudo apt-get update
+  sudo apt-get install -y unattended-upgrades
+
+  # Enable apt timers if present
+  for t in apt-daily.timer apt-daily-upgrade.timer; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${t}"; then
+      sudo systemctl enable --now "$t" >/dev/null 2>&1 || true
+    fi
+  done
+
+  # Ensure unattended-upgrades is enabled
+  if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+    sudo sed -i \
+      -e 's/^\s*APT::Periodic::Update-Package-Lists.*/APT::Periodic::Update-Package-Lists "1";/' \
+      -e 's/^\s*APT::Periodic::Unattended-Upgrade.*/APT::Periodic::Unattended-Upgrade "1";/' \
+      /etc/apt/apt.conf.d/20auto-upgrades || true
+  else
+    cat <<'EOF' | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  fi
+}
+
+# ==============================================================================
 # Preflight scans (before Proceed?)
-# ===============================
+# ==============================================================================
 show_preflight_bundle() {
   echo
   echo "========== PREFLIGHT SUMMARY =========="
@@ -428,11 +599,6 @@ show_preflight_bundle() {
   else
     echo "  - sshd binary not found (openssh-server may not be installed yet)"
   fi
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.service|^sshd\.service'; then
-    echo "  - ssh unit file present"
-  else
-    echo "  - ssh unit file not detected in list-unit-files (may still exist; script handles this)"
-  fi
 
   echo "Disk / memory:"
   df -h / 2>/dev/null | sed 's/^/      /' || true
@@ -447,9 +613,126 @@ show_preflight_bundle() {
   echo "      If your SSH CIDRs are wrong, you could lock yourself out."
 }
 
-# ===============================
+# ==============================================================================
+# Mutations
+# ==============================================================================
+configure_grub_serial() {
+  set -e
+  local GRUB=/etc/default/grub
+  [[ -f "$GRUB" ]] || return 0
+
+  sudo sed -i \
+    -e 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"/' \
+    -e 's/^GRUB_TERMINAL=.*/GRUB_TERMINAL="serial console"/' \
+    -e 's/^GRUB_SERIAL_COMMAND=.*/GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"/' \
+    "$GRUB" 2>/dev/null || true
+
+  grep -q '^GRUB_CMDLINE_LINUX=' "$GRUB" || echo 'GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"' | sudo tee -a "$GRUB" >/dev/null
+  grep -q '^GRUB_TERMINAL=' "$GRUB" || echo 'GRUB_TERMINAL="serial console"' | sudo tee -a "$GRUB" >/dev/null
+  grep -q '^GRUB_SERIAL_COMMAND=' "$GRUB" || echo 'GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"' | sudo tee -a "$GRUB" >/dev/null
+  sudo update-grub
+}
+
+configure_sshd() {
+  set -e
+  local SSHD=/etc/ssh/sshd_config
+  [[ -f "$SSHD" ]] || { warn "missing $SSHD"; return 0; }
+
+  # Disable root SSH login
+  if grep -qE '^\s*#?\s*PermitRootLogin' "$SSHD"; then
+    sudo sed -i 's/^\s*#\?\s*PermitRootLogin.*/PermitRootLogin no/' "$SSHD"
+  else
+    echo 'PermitRootLogin no' | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  # Enable SSH password authentication (intentional choice; rely on UFW CIDRs)
+  if grep -qE '^\s*#?\s*PasswordAuthentication' "$SSHD"; then
+    sudo sed -i 's/^\s*#\?\s*PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD"
+  else
+    echo 'PasswordAuthentication yes' | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  # Ensure PAM enabled
+  if grep -qE '^\s*#?\s*UsePAM' "$SSHD"; then
+    sudo sed -i 's/^\s*#\?\s*UsePAM.*/UsePAM yes/' "$SSHD"
+  else
+    echo 'UsePAM yes' | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  # Lightweight daemon-side brute-force mitigation
+  if grep -qE '^\s*#?\s*MaxAuthTries' "$SSHD"; then
+    sudo sed -i "s/^\s*#\?\s*MaxAuthTries.*/MaxAuthTries ${SSHD_MAX_AUTH_TRIES}/" "$SSHD"
+  else
+    echo "MaxAuthTries ${SSHD_MAX_AUTH_TRIES}" | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  if grep -qE '^\s*#?\s*LoginGraceTime' "$SSHD"; then
+    sudo sed -i "s/^\s*#\?\s*LoginGraceTime.*/LoginGraceTime ${SSHD_LOGIN_GRACE_TIME}/" "$SSHD"
+  else
+    echo "LoginGraceTime ${SSHD_LOGIN_GRACE_TIME}" | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  if grep -qE '^\s*#?\s*ClientAliveInterval' "$SSHD"; then
+    sudo sed -i "s/^\s*#\?\s*ClientAliveInterval.*/ClientAliveInterval ${SSHD_CLIENT_ALIVE_INTERVAL}/" "$SSHD"
+  else
+    echo "ClientAliveInterval ${SSHD_CLIENT_ALIVE_INTERVAL}" | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  if grep -qE '^\s*#?\s*ClientAliveCountMax' "$SSHD"; then
+    sudo sed -i "s/^\s*#\?\s*ClientAliveCountMax.*/ClientAliveCountMax ${SSHD_CLIENT_ALIVE_COUNT_MAX}/" "$SSHD"
+  else
+    echo "ClientAliveCountMax ${SSHD_CLIENT_ALIVE_COUNT_MAX}" | sudo tee -a "$SSHD" >/dev/null
+  fi
+
+  # Validate config if possible
+  if command -v sshd >/dev/null 2>&1; then
+    sudo sshd -t
+  fi
+}
+
+configure_ufw() {
+  set -e
+  sudo ufw --force reset
+  sudo ufw default deny incoming
+  sudo ufw default allow outgoing
+
+  sudo ufw allow from "${LAN_SSH_CIDR}" to any port 22 proto tcp
+  sudo ufw allow from "${VPN_SSH_CIDR}" to any port 22 proto tcp
+
+  if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
+    for p in "${PUBLIC_ALLOW_RULES[@]}"; do
+      sudo ufw allow "${p}"
+    done
+  fi
+
+  sudo ufw logging low
+  sudo ufw --force enable
+  sudo ufw status verbose
+}
+
+# ==============================================================================
+# Arg parsing (minimal)
+# ==============================================================================
+DO_SELF_UPDATE=0
+CLI_URL=""
+CLI_SHA256=""
+
+i=1
+while [[ $i -le $# ]]; do
+  a="${!i}"
+  case "$a" in
+    --help|-h) usage; exit 0 ;;
+    --version) print_version; exit 0 ;;
+    --self-update) DO_SELF_UPDATE=1 ;;
+    --url) i=$((i+1)); CLI_URL="${!i:-}" ;;
+    --sha256) i=$((i+1)); CLI_SHA256="${!i:-}" ;;
+  esac
+  i=$((i+1))
+done
+
+# ==============================================================================
 # Main
-# ===============================
+# ==============================================================================
 need_cmd sudo
 need_cmd systemctl
 need_cmd sed
@@ -464,10 +747,35 @@ if [[ "$EUID" -eq 0 ]]; then
   exit 1
 fi
 
-# Warm up sudo (so you don't get interrupted by prompts mid-script)
+# Warm up sudo (avoid prompt mid-steps)
 sudo -v
 
 load_profile_if_present
+
+# If self-update: allow CLI override, else use profile UPSTREAM_URL (prompt if empty)
+if [[ "$DO_SELF_UPDATE" -eq 1 ]]; then
+  if [[ -n "${CLI_URL}" ]]; then
+    UPSTREAM_URL="${CLI_URL}"
+  fi
+  if [[ -n "${CLI_SHA256}" ]]; then
+    UPSTREAM_SHA256="${CLI_SHA256}"
+  fi
+
+  # If still no URL, prompt and offer to save it.
+  if [[ -z "${UPSTREAM_URL:-}" ]]; then
+    echo
+    prompt_nonempty UPSTREAM_URL "Upstream raw URL for hardening-vm.sh"
+    echo
+    if confirm_yn "Save this UPSTREAM_URL to ${PROFILE_PATH} for future self-updates?"; then
+      # ensure other prompts have values before saving (use defaults as needed)
+      ensure_required_inputs
+      run_step "Save hardening profile" save_profile
+    fi
+  fi
+
+  self_update "${UPSTREAM_URL}" "${UPSTREAM_SHA256}"
+fi
+
 ensure_required_inputs
 
 show_preflight_bundle
@@ -480,7 +788,6 @@ echo
 
 confirm_yn "Proceed to apply hardening?" || { echo "Aborted."; exit 0; }
 
-# Import existing UFW public ports BEFORE saving profile
 prompt_import_existing_ufw_public_ports
 prompt_additional_public_ports
 
@@ -497,89 +804,20 @@ if confirm_yn "Save these settings to ${PROFILE_PATH} for future runs?"; then
 fi
 
 run_step "Set timezone" sudo timedatectl set-timezone "${TIMEZONE}"
-
 run_step "APT preflight (fix malformed sources if needed)" check_and_fix_malformed_sources
 
 run_step "Install baseline packages" bash -c '
 sudo apt-get update
-sudo apt-get install -y ufw qemu-guest-agent unattended-upgrades openssh-server
+sudo apt-get install -y ufw unattended-upgrades openssh-server
 '
 
-run_step "QEMU guest agent (start; enable best-effort)" start_qemu_guest_agent
-
+run_step "Enable unattended security updates" enable_unattended_security_updates
+run_step "Ensure QEMU guest agent (best-effort)" ensure_qemu_guest_agent
 run_step "Enable serial console" sudo systemctl enable --now serial-getty@ttyS0
-
-run_step "Configure GRUB for serial console" bash -c '
-set -e
-GRUB=/etc/default/grub
-sudo sed -i \
-  -e "s/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=\"console=tty0 console=ttyS0,115200n8\"/" \
-  -e "s/^GRUB_TERMINAL=.*/GRUB_TERMINAL=\"serial console\"/" \
-  -e "s/^GRUB_SERIAL_COMMAND=.*/GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"/" \
-  "$GRUB" || true
-
-grep -q GRUB_CMDLINE_LINUX "$GRUB" || echo "GRUB_CMDLINE_LINUX=\"console=tty0 console=ttyS0,115200n8\"" | sudo tee -a "$GRUB" >/dev/null
-grep -q GRUB_TERMINAL "$GRUB" || echo "GRUB_TERMINAL=\"serial console\"" | sudo tee -a "$GRUB" >/dev/null
-grep -q GRUB_SERIAL_COMMAND "$GRUB" || echo "GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"" | sudo tee -a "$GRUB" >/dev/null
-sudo update-grub
-'
-
-run_step "Configure SSH (disable root, enable password auth)" bash -c '
-set -e
-SSHD=/etc/ssh/sshd_config
-
-if command -v sshd >/dev/null 2>&1; then
-  sudo sshd -t || true
-fi
-
-if grep -qE "^\s*#?\s*PermitRootLogin" "$SSHD"; then
-  sudo sed -i "s/^\s*#\?\s*PermitRootLogin.*/PermitRootLogin no/" "$SSHD"
-else
-  echo "PermitRootLogin no" | sudo tee -a "$SSHD" >/dev/null
-fi
-
-if grep -qE "^\s*#?\s*PasswordAuthentication" "$SSHD"; then
-  sudo sed -i "s/^\s*#\?\s*PasswordAuthentication.*/PasswordAuthentication yes/" "$SSHD"
-else
-  echo "PasswordAuthentication yes" | sudo tee -a "$SSHD" >/dev/null
-fi
-
-if grep -qE "^\s*#?\s*UsePAM" "$SSHD"; then
-  sudo sed -i "s/^\s*#\?\s*UsePAM.*/UsePAM yes/" "$SSHD"
-else
-  echo "UsePAM yes" | sudo tee -a "$SSHD" >/dev/null
-fi
-
-if command -v sshd >/dev/null 2>&1; then
-  sudo sshd -t
-fi
-'
-
+run_step "Configure GRUB for serial console" configure_grub_serial
+run_step "Configure SSH (disable root; allow passwords; safe hardening knobs)" configure_sshd
 run_step "Reload SSH service" reload_ssh_service
-
-run_step "Configure UFW" bash -c '
-set -e
-sudo ufw --force reset
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-
-sudo ufw allow from "'"${LAN_SSH_CIDR}"'" to any port 22 proto tcp
-sudo ufw allow from "'"${VPN_SSH_CIDR}"'" to any port 22 proto tcp
-'
-
-if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
-  for p in "${PUBLIC_ALLOW_RULES[@]}"; do
-    run_step "UFW allow public ${p}" sudo ufw allow "${p}"
-  done
-fi
-
-run_step "Enable UFW + show status" bash -c '
-set -e
-sudo ufw logging low
-sudo ufw --force enable
-sudo ufw status verbose
-'
-
+run_step "Configure UFW" configure_ufw
 run_step "APT sources cleanup (optional)" clean_up_apt_sources
 
 echo
