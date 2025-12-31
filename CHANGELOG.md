@@ -10,6 +10,24 @@ The format is based on Keep a Changelog, and this project loosely follows Semant
 
 ---
 
+## [0.4.0]
+
+### Added
+
+- Disk strategy selection: `overlay` (qcow2 backing file) or `copy` (full qcow2 copy) for faster, more repeatable VM creation.
+- Optional NoCloud `network-config` generation to force DHCP on first boot (helps avoid “VM has no IP” edge cases).
+- Run logging: each invocation logs to `/var/log/create-vm/<vm>-<timestamp>.log` for troubleshooting and auditability.
+- Post-create IP wait: optional polling of `virsh domifaddr` to surface the VM IP after creation.
+- `--destroy <name>` mode: stop + undefine the VM and remove best-effort associated artifacts (disk + seed dirs) with confirmation.
+- Host preflight sanity check to confirm libvirt is reachable before proceeding.
+
+### Changed
+
+- Cloud-init now includes `growpart`/`resize_rootfs` so resized disks expand automatically on first boot.
+- Boot-dir cleanup now targets only `ubuntu-<codename>-(standard|minimal)` directories defensively.
+
+---
+
 ## [0.3.0]
 
 ### Added
