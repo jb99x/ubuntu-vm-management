@@ -10,6 +10,22 @@ The format is based on Keep a Changelog, and this project loosely follows Semant
 
 ---
 
+## [0.4.1]
+
+### Fixed
+
+- **DHCP reliability on bridged networks:** generated `network-config` now matches the VM NIC by **MAC address** (instead of assuming `eth0`), and the same MAC is passed to `virt-install`.
+- **Guest agent availability:** `qemu-guest-agent` is now ensured via a defensive `apt-get install` in `runcmd`, preventing missing-service cases when cloud-init package installs run before networking stabilizes.
+- **Safer cloud-init cleanup:** per-VM seed directory cleanup defaults to **false** to avoid removing the seed before first-boot completion.
+- **Improved IP discovery:** `virsh domifaddr` is attempted with multiple sources; when still unavailable, the script prints MAC-based guidance for checking DHCP leases.
+
+### Changed
+
+- First-boot `runcmd` now restarts `systemd-networkd` before package installation to reduce early-boot timing issues.
+- Post-run guidance explicitly notes that IP discovery may be blank for bridged VMs without a working guest agent.
+
+---
+
 ## [0.4.0]
 
 ### Added

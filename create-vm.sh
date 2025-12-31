@@ -4,9 +4,11 @@ set -euo pipefail
 # ==============================================================================
 # create-vm.sh — Create an Ubuntu Server VM (libvirt/virt-install) with cloud-init
 #
-# v0.4.0: unattended cloud-image import + safer networking + disk strategy options
-#         (overlay vs full copy), optional network-config (force DHCP), run logging,
-#         and an optional destroy/cleanup mode.
+# v0.4.1: Fix DHCP + guest-agent reliability for bridged networks.
+#         - network-config matches the VM NIC by MAC (no more eth0/ens* guessing)
+#         - ensure qemu-guest-agent is installed + started (runcmd safety net)
+#         - safer cloud-init seed cleanup (default is to keep until you confirm)
+#         - improved IP discovery attempts + clearer “bridged network” guidance
 # ==============================================================================
 
 # -------------------------------
@@ -22,7 +24,7 @@ VCPUS_DEFAULT="2"
 MAX_VCPUS_DEFAULT="2"
 DISK_SIZE_GB_DEFAULT="50"
 
-BRIDGE_IF_DEFAULT="bridge0"                 # will prompt if not found
+BRIDGE_IF_DEFAULT="bridge0"
 OS_VARIANT_DEFAULT="ubuntu24.04"
 
 LAN_SSH_CIDR_DEFAULT="192.168.1.0/24"
@@ -41,10 +43,12 @@ CREATE_PROFILE_PATH="/etc/create-vm-profile.conf"
 LOG_DIR_DEFAULT="/var/log/create-vm"
 
 PUBLIC_ALLOW_RULES_DEFAULT=(
-  # "443/tcp"
+  # "25565/tcp"
 )
 
-CLEANUP_VM_CLOUDINIT_DIR_DEFAULT="true"     # true|false
+# Important: deleting the seed too early can break first-boot config on some systems.
+# Default is now to KEEP the per-VM cloud-init seed dir unless you explicitly delete it.
+CLEANUP_VM_CLOUDINIT_DIR_DEFAULT="false"    # true|false
 KEEP_UBUNTU_BOOT_DIRS_DEFAULT="2"
 
 # -------------------------------
@@ -92,9 +96,6 @@ validate_cidr() {
 }
 
 validate_password() {
-  # Avoid “surprise login failures” on consoles:
-  # - 8..64 chars
-  # - printable ASCII, no spaces
   local p="$1"
   [[ "${#p}" -ge 8 && "${#p}" -le 64 ]] || return 1
   [[ "$p" =~ ^[[:graph:]]+$ ]] || return 1
@@ -176,10 +177,16 @@ ensure_iface_exists_or_prompt() {
   done
 }
 
+random_mac() {
+  # Locally-administered unicast MAC (qemu-ish prefix)
+  local b1 b2 b3
+  b1=$(printf '%02x' $(( RANDOM % 256 )))
+  b2=$(printf '%02x' $(( RANDOM % 256 )))
+  b3=$(printf '%02x' $(( RANDOM % 256 )))
+  printf '52:54:00:%s:%s:%s\n' "$b1" "$b2" "$b3"
+}
+
 verify_sha256_from_sums() {
-  # Supports both formats in SHA256SUMS:
-  #   <hash> *filename
-  #   <hash>  filename
   local file_path="$1" file_name="$2" sums_path="$3"
   awk -v name="$file_name" -v fpath="$file_path" '
     $2 ~ ("\\*?" name "$") { print $1 " " fpath }
@@ -224,10 +231,10 @@ cleanup_cloudinit_dir() {
   echo "Cleanup candidate (cloud-init artifacts for this VM):"
   echo "  - ${dir}"
   sudo find "$dir" -maxdepth 1 -type f -printf "  - %p\n" 2>/dev/null || true
-  if confirm_yn "Delete this cloud-init directory now?"; then
+  if confirm_yn "Delete this cloud-init directory now? (Recommended: only after you've logged in and confirmed first boot)"; then
     safe_rm_rf "$dir" || true
   else
-    echo "Skipped deleting cloud-init directory."
+    echo "Keeping cloud-init seed directory for safety: ${dir}"
   fi
 }
 
@@ -253,28 +260,39 @@ cleanup_old_ubuntu_boot_dirs() {
   echo
   echo "Cleanup candidates (old Ubuntu boot dirs):"
   for p in "${delete_paths[@]}"; do echo "  - ${p}"; done
-  if confirm_yn "Delete these old Ubuntu boot directories now?"; then
-    local failures=0
-    for p in "${delete_paths[@]}"; do safe_rm_rf "$p" || failures=$((failures+1)); done
-    (( failures == 0 )) || echo "WARN: cleanup completed with ${failures} failure(s)."
-  fi
+  confirm_yn "Delete these old Ubuntu boot directories now?" || return 0
+  local failures=0
+  for p in "${delete_paths[@]}"; do safe_rm_rf "$p" || failures=$((failures+1)); done
+  (( failures == 0 )) || echo "WARN: cleanup completed with ${failures} failure(s)."
 }
 
 wait_for_ip() {
   local vm="$1" timeout="$2"
   local end=$(( $(date +%s) + timeout ))
   echo
-  echo "Waiting up to ${timeout}s for VM IP via 'virsh domifaddr'..."
+  echo "Waiting up to ${timeout}s for VM IP..."
+  echo "Note: on bridged networks, libvirt may not be able to discover the IP without qemu-guest-agent."
   while (( $(date +%s) < end )); do
-    local out
+    local out=""
+    out="$(sudo virsh domifaddr "$vm" --source agent 2>/dev/null || true)"
+    if echo "$out" | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "$out"; return 0; fi
+
+    out="$(sudo virsh domifaddr "$vm" --source lease 2>/dev/null || true)"
+    if echo "$out" | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "$out"; return 0; fi
+
+    out="$(sudo virsh domifaddr "$vm" --source arp 2>/dev/null || true)"
+    if echo "$out" | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "$out"; return 0; fi
+
     out="$(sudo virsh domifaddr "$vm" 2>/dev/null || true)"
-    if echo "$out" | awk 'tolower($0) ~ /ipv4/ && $0 ~ /([0-9]{1,3}\.){3}[0-9]{1,3}/ {print $0}' | head -n1 >/dev/null; then
-      echo "$out"
-      return 0
-    fi
+    if echo "$out" | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then echo "$out"; return 0; fi
+
     sleep 3
   done
-  echo "No IP detected within timeout. This can be normal depending on your network/DHCP."
+  echo "No IP discovered via virsh. If this VM is bridged to your LAN, that can be normal."
+  echo "Try:"
+  echo "  - console in: sudo virsh console ${vm}"
+  echo "  - inside VM:  ip link; ip -4 addr; ip route"
+  echo "  - on DHCP:    check your router/UniFi leases for MAC ${VM_MAC}"
   return 0
 }
 
@@ -283,10 +301,6 @@ usage() {
 Usage:
   create-vm                 # interactive create
   create-vm --destroy NAME  # destroy VM + associated disk + cloud-init seed dir (with confirmation)
-
-Notes:
-  - Designed for Ubuntu cloud images + virt-install --import (unattended).
-  - VNC is optional (default off). If enabled, default listen is 127.0.0.1 for SSH tunneling.
 EOF
 }
 
@@ -298,91 +312,6 @@ if [[ "$EUID" -eq 0 ]]; then
   exit 1
 fi
 sudo -v
-
-# -------------------------------
-# Optional create-profile (root-owned defaults)
-# -------------------------------
-load_create_profile_if_present() {
-  if [[ -f "${CREATE_PROFILE_PATH}" ]]; then
-    echo "Create-profile detected: ${CREATE_PROFILE_PATH}"
-    echo "Loading create-profile..."
-    local tmp; tmp="$(mktemp)"
-    sudo cat "${CREATE_PROFILE_PATH}" > "${tmp}"
-    # shellcheck disable=SC1090
-    source "${tmp}"
-    rm -f "${tmp}"
-    echo "Create-profile loaded."
-  else
-    echo "No create-profile found at ${CREATE_PROFILE_PATH}."
-  fi
-
-  if declare -p PUBLIC_ALLOW_RULES_DEFAULT >/dev/null 2>&1; then
-    if ! declare -p PUBLIC_ALLOW_RULES_DEFAULT | grep -q 'declare \-a'; then
-      local tmpv="${PUBLIC_ALLOW_RULES_DEFAULT:-}"
-      unset PUBLIC_ALLOW_RULES_DEFAULT
-      declare -a PUBLIC_ALLOW_RULES_DEFAULT=()
-      [[ -n "${tmpv}" ]] && PUBLIC_ALLOW_RULES_DEFAULT+=( "${tmpv}" )
-    fi
-  else
-    declare -a PUBLIC_ALLOW_RULES_DEFAULT=()
-  fi
-}
-
-save_create_profile() {
-  echo
-  echo "Create-profile save preview (will write to ${CREATE_PROFILE_PATH}):"
-  echo "  TIMEZONE_DEFAULT=${TIMEZONE}"
-  echo "  LAN_SSH_CIDR_DEFAULT=${LAN_SSH_CIDR}"
-  echo "  VPN_SSH_CIDR_DEFAULT=${VPN_SSH_CIDR}"
-  echo "  BRIDGE_IF_DEFAULT=${BRIDGE_IF}"
-  echo "  OS_VARIANT_DEFAULT=${OS_VARIANT}"
-  echo "  UBUNTU_CODENAME_DEFAULT=${UBUNTU_CODENAME}"
-  echo "  IMAGE_FLAVOR_DEFAULT=${IMAGE_FLAVOR}"
-  echo "  DISK_MODE_DEFAULT=${DISK_MODE}"
-  echo "  FORCE_DHCP_NETCFG_DEFAULT=${FORCE_DHCP_NETCFG}"
-  echo "  VNC_DEFAULT=${VNC_MODE}"
-  echo "  WAIT_FOR_IP_DEFAULT=${WAIT_FOR_IP_MODE}"
-  echo "  LOG_DIR_DEFAULT=${LOG_DIR}"
-  echo "  CLEANUP_VM_CLOUDINIT_DIR_DEFAULT=${CLEANUP_VM_CLOUDINIT_DIR}"
-  echo "  KEEP_UBUNTU_BOOT_DIRS_DEFAULT=${KEEP_UBUNTU_BOOT_DIRS}"
-  if (( ${#PUBLIC_ALLOW_RULES[@]} > 0 )); then
-    echo "  PUBLIC_ALLOW_RULES_DEFAULT:"
-    for p in "${PUBLIC_ALLOW_RULES[@]}"; do echo "    - ${p}"; done
-  else
-    echo "  PUBLIC_ALLOW_RULES_DEFAULT: (none)"
-  fi
-  echo
-  confirm_yn "Save these defaults to ${CREATE_PROFILE_PATH} for future runs?" || { echo "Skipped saving create-profile."; return 0; }
-
-  local tmp; tmp="$(mktemp)"
-  {
-    echo "# Generated by create-vm.sh on $(date -Is)"
-    echo "# This file is bash-sourceable."
-    echo
-    printf 'TIMEZONE_DEFAULT=%q\n' "${TIMEZONE}"
-    printf 'LAN_SSH_CIDR_DEFAULT=%q\n' "${LAN_SSH_CIDR}"
-    printf 'VPN_SSH_CIDR_DEFAULT=%q\n' "${VPN_SSH_CIDR}"
-    printf 'BRIDGE_IF_DEFAULT=%q\n' "${BRIDGE_IF}"
-    printf 'OS_VARIANT_DEFAULT=%q\n' "${OS_VARIANT}"
-    printf 'UBUNTU_CODENAME_DEFAULT=%q\n' "${UBUNTU_CODENAME}"
-    printf 'IMAGE_FLAVOR_DEFAULT=%q\n' "${IMAGE_FLAVOR}"
-    printf 'DISK_MODE_DEFAULT=%q\n' "${DISK_MODE}"
-    printf 'FORCE_DHCP_NETCFG_DEFAULT=%q\n' "${FORCE_DHCP_NETCFG}"
-    printf 'VNC_DEFAULT=%q\n' "${VNC_MODE}"
-    printf 'WAIT_FOR_IP_DEFAULT=%q\n' "${WAIT_FOR_IP_MODE}"
-    printf 'WAIT_FOR_IP_TIMEOUT_DEFAULT=%q\n' "${WAIT_FOR_IP_TIMEOUT}"
-    printf 'LOG_DIR_DEFAULT=%q\n' "${LOG_DIR}"
-    printf 'CLEANUP_VM_CLOUDINIT_DIR_DEFAULT=%q\n' "${CLEANUP_VM_CLOUDINIT_DIR}"
-    printf 'KEEP_UBUNTU_BOOT_DIRS_DEFAULT=%q\n' "${KEEP_UBUNTU_BOOT_DIRS}"
-    echo "PUBLIC_ALLOW_RULES_DEFAULT=("
-    for p in "${PUBLIC_ALLOW_RULES[@]}"; do printf '  %q\n' "${p}"; done
-    echo ")"
-    echo
-  } > "${tmp}"
-  sudo install -m 600 -o root -g root "${tmp}" "${CREATE_PROFILE_PATH}"
-  rm -f "${tmp}"
-  echo "OK: saved create-profile to ${CREATE_PROFILE_PATH}"
-}
 
 # -------------------------------
 # Args
@@ -419,17 +348,40 @@ if [[ "${1:-}" == "--destroy" ]]; then
   fi
 
   mapfile -t SEED_DIRS < <(sudo find /var/lib/libvirt/boot -maxdepth 4 -type d -path "*/cloud-init/${VM_TO_DESTROY}" 2>/dev/null || true)
-  for d in "${SEED_DIRS[@]:-}"; do
-    safe_rm_rf "$d" || true
-  done
+  for d in "${SEED_DIRS[@]:-}"; do safe_rm_rf "$d" || true; done
 
   echo "Done."
   exit 0
 fi
 
 # -------------------------------
-# Load profile defaults
+# Optional create-profile (root-owned defaults)
 # -------------------------------
+load_create_profile_if_present() {
+  if [[ -f "${CREATE_PROFILE_PATH}" ]]; then
+    echo "Create-profile detected: ${CREATE_PROFILE_PATH}"
+    echo "Loading create-profile..."
+    local tmp; tmp="$(mktemp)"
+    sudo cat "${CREATE_PROFILE_PATH}" > "${tmp}"
+    # shellcheck disable=SC1090
+    source "${tmp}"
+    rm -f "${tmp}"
+    echo "Create-profile loaded."
+  else
+    echo "No create-profile found at ${CREATE_PROFILE_PATH}."
+  fi
+
+  if declare -p PUBLIC_ALLOW_RULES_DEFAULT >/dev/null 2>&1; then
+    if ! declare -p PUBLIC_ALLOW_RULES_DEFAULT | grep -q 'declare \-a'; then
+      local tmpv="${PUBLIC_ALLOW_RULES_DEFAULT:-}"
+      unset PUBLIC_ALLOW_RULES_DEFAULT
+      declare -a PUBLIC_ALLOW_RULES_DEFAULT=()
+      [[ -n "${tmpv}" ]] && PUBLIC_ALLOW_RULES_DEFAULT+=( "${tmpv}" )
+    fi
+  else
+    declare -a PUBLIC_ALLOW_RULES_DEFAULT=()
+  fi
+}
 load_create_profile_if_present
 
 # -------------------------------
@@ -444,15 +396,8 @@ ensure_cmd_or_install openssl openssl
 ensure_cmd_or_install virt-install virtinst
 ensure_cmd_or_install virsh libvirt-clients
 ensure_cmd_or_install qemu-img qemu-utils
-ensure_cmd_or_install qemu-system-x86_64 qemu-system-x86
 
-HAVE_CLOUD_LOCALDS=0
-if need_cmd cloud-localds; then
-  HAVE_CLOUD_LOCALDS=1
-else
-  apt_install_prompt cloud-image-utils
-  HAVE_CLOUD_LOCALDS=1
-fi
+if need_cmd cloud-localds; then :; else apt_install_prompt cloud-image-utils; fi
 
 # -------------------------------
 # Interactive inputs
@@ -498,6 +443,7 @@ prompt_with_default CLEANUP_VM_CLOUDINIT_DIR "Cleanup per-VM cloud-init dir afte
 prompt_with_default KEEP_UBUNTU_BOOT_DIRS "Keep newest N ubuntu-* boot dirs" "${KEEP_UBUNTU_BOOT_DIRS_DEFAULT}"
 
 VM_HOSTNAME="${VM_NAME}"
+VM_MAC="$(random_mac)"
 
 ADMIN_PASS_HASH="$(printf '%s' "${ADMIN_PASS_PLAIN}" | openssl passwd -6 -stdin)"
 unset ADMIN_PASS_PLAIN
@@ -515,7 +461,6 @@ if confirm_yn "Add any public ports to allow from the internet (UFW allow Anywhe
 fi
 
 log_setup "${VM_NAME}"
-
 preflight_host
 
 # -------------------------------
@@ -552,6 +497,7 @@ echo "VM:"
 echo "  Name:        ${VM_NAME}"
 echo "  Hostname:    ${VM_HOSTNAME}"
 echo "  Admin user:  ${ADMIN_USER}"
+echo "  MAC:         ${VM_MAC}"
 echo "Resources:"
 echo "  RAM:         ${RAM_MB} MB (max ${MAX_RAM_MB} MB)"
 echo "  vCPUs:       ${VCPUS} (max ${MAX_VCPUS})"
@@ -669,13 +615,20 @@ resize_rootfs: true
 
 package_update: true
 package_upgrade: false
+
 packages:
   - ufw
-  - qemu-guest-agent
   - unattended-upgrades
   - openssh-server
+  - qemu-guest-agent
 
 runcmd:
+  - [ systemctl, restart, "systemd-networkd.service" ]
+  - |
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ufw unattended-upgrades openssh-server qemu-guest-agent
   - [ systemctl, enable, --now, "serial-getty@ttyS0.service" ]
   - [ systemctl, enable, --now, "qemu-guest-agent.service" ]
   - |
@@ -717,10 +670,13 @@ local-hostname: ${VM_HOSTNAME}
 EOF
 
 if [[ "${FORCE_DHCP_NETCFG}" == "on" ]]; then
-  sudo tee "${CI_NET_CFG}" >/dev/null <<'EOF'
+  sudo tee "${CI_NET_CFG}" >/dev/null <<EOF
 version: 2
 ethernets:
-  eth0:
+  primary:
+    match:
+      macaddress: ${VM_MAC}
+    set-name: eth0
     dhcp4: true
     dhcp6: false
 EOF
@@ -740,7 +696,18 @@ if [[ "${VNC_MODE}" == "on" ]]; then
   GRAPHICS_ARGS=(--graphics "vnc,listen=${VNC_LISTEN},port=-1")
 fi
 
-sudo virt-install   --name "${VM_NAME}"   --os-variant "${OS_VARIANT}"   --memory "${RAM_MB}",maxmemory="${MAX_RAM_MB}"   --vcpus "${VCPUS}",maxvcpus="${MAX_VCPUS}"   --disk path="${DISK_PATH}",bus=virtio,discard=unmap   --disk path="${CI_SEED_ISO}",device=cdrom,readonly=on   --network bridge="${BRIDGE_IF}",model=virtio   "${GRAPHICS_ARGS[@]}"   --console pty,target_type=serial   --import   --noautoconsole
+sudo virt-install \
+  --name "${VM_NAME}" \
+  --os-variant "${OS_VARIANT}" \
+  --memory "${RAM_MB}",maxmemory="${MAX_RAM_MB}" \
+  --vcpus "${VCPUS}",maxvcpus="${MAX_VCPUS}" \
+  --disk path="${DISK_PATH}",bus=virtio,discard=unmap \
+  --disk path="${CI_SEED_ISO}",device=cdrom,readonly=on \
+  --network bridge="${BRIDGE_IF}",model=virtio,mac="${VM_MAC}" \
+  "${GRAPHICS_ARGS[@]}" \
+  --console pty,target_type=serial \
+  --import \
+  --noautoconsole
 
 echo "VM '${VM_NAME}' created and started."
 
@@ -756,4 +723,5 @@ echo "Done."
 echo "Next:"
 echo "  - Serial console:  sudo virsh console ${VM_NAME}   (exit with Ctrl+])"
 echo "  - SSH (from allowed CIDRs): ssh ${ADMIN_USER}@<vm-ip>"
+echo "  - If bridged IP isn't discoverable: check DHCP leases for MAC ${VM_MAC}"
 echo "  - Run log: ${LOG_FILE}"
