@@ -14,12 +14,13 @@ The project is intentionally:
 
 - `create-vm.sh` — unattended Ubuntu VM creation using Canonical cloud images
 - `hardening-vm.sh` — idempotent hardening for existing Ubuntu VMs
+- `maintenance.sh` — scheduled maintenance for hosts/VMs (systemd timer; wget self-update; profile-driven)
 - `COMMANDS.md` — operational runbook / quick-reference
 - `CHANGELOG.md` — project history
 
 ---
 
-## create-vm.sh
+## Create
 
 ### What it does
 
@@ -71,7 +72,7 @@ Do **not** use it for retrofitting existing installations.
 
 ---
 
-## hardening-vm.sh
+## Hardening
 
 ### What it does
 
@@ -97,14 +98,63 @@ Do **not** use it for retrofitting existing installations.
 
 ---
 
+## Maintenance
+
+### What it does
+
+The `maintenance` script provides a **safe, repeatable maintenance routine** for both **hosts and VMs**, suitable for manual execution or unattended scheduling via a systemd timer.
+
+It performs standard OS upkeep without modifying security posture or making environment-specific assumptions.
+
+**Core tasks:**
+
+- Runs full APT hygiene:
+  - `apt-get update`, `full-upgrade`, `autoremove --purge`, `autoclean`, `check`
+- Attempts best-effort package repair if needed (`dpkg --audit`, `dpkg --configure -a`)
+
+**Additional upkeep (best-effort):**
+
+- Refreshes Snap packages if Snap is installed
+- Vacuums systemd journal logs (keeps last 30 days)
+- Performs filesystem trim (`fstrim`) when appropriate
+
+**Environment-aware checks:**
+
+- Detects host vs VM and runs relevant status checks
+- Hosts: verifies `libvirt-guests` and lists VMs
+- VMs: checks `qemu-guest-agent` and cloud-init services
+
+**Post-run visibility:**
+
+- Indicates whether a reboot is required
+- Shows recent unattended-upgrades activity
+- Displays network, disk, and memory summaries
+- Lists currently upgradable packages (preview)
+
+**Scheduling & updates:**
+
+- Supports unattended runs via a systemd timer
+- Can self-update via `wget` from a user-supplied URL stored in a profile
+- Never reboots by default; reboot behaviour is always explicit or profile-driven
+
+### Profiles
+
+`maintenance.sh` can load/save a root-owned profile:
+
+- `/etc/maintenance-profile.conf`
+
+---
+
 ## Recommended filesystem layout
 
 ```text
 /opt/ubuntu-vm-management/              # git checkout
 /usr/local/sbin/create-vm               # symlink to create-vm.sh
 /usr/local/sbin/hardening-vm            # symlink to hardening-vm.sh
+/usr/local/sbin/maintenance             # symlink to maintenance.sh
 /etc/create-vm-profile.conf             # local-only (not in git)
 /etc/hardening-profile.conf             # local-only (not in git)
+/etc/maintenance-profile.conf           # local-only (not in git)
 ```
 
 ---

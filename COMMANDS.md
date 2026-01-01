@@ -203,3 +203,27 @@ sudo chmod 0755 /usr/local/sbin/hardening-vm
 # update later
 hardening-vm --self-update
 ```
+
+## maintenance.sh
+
+```bash
+# Install
+sudo install -m 0755 -o root -g root maintenance.sh /usr/local/sbin/maintenance
+
+# Run now (interactive)
+maintenance
+
+# Run unattended (for timers)
+maintenance --unattended
+
+# Install/enable systemd timer+service (profile-driven schedule)
+maintenance --install
+
+# List / inspect timer
+systemctl status maintenance.timer maintenance.service --no-pager
+systemctl list-timers --all | grep -i maintenance || true
+systemctl cat maintenance.service maintenance.timer
+
+# Self-update (wget-based; requires UPSTREAM_URL in /etc/maintenance-profile.conf)
+maintenance --self-update
+```

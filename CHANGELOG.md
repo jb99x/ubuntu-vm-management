@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [1.2.0]
+
+### Added
+
+- `maintenance.sh`: generic maintenance script for Ubuntu hosts and VMs (APT maintenance, unattended-upgrades enablement, journal vacuum, logrotate, optional fstrim).
+- Optional `maintenance --install` to deploy a systemd timer+service (profile-driven schedule; unattended runs).
+- `maintenance --self-update` (wget-based) with optional SHA256 pinning; upstream URL stored in `/etc/maintenance-profile.conf` (no default URL).
+
+---
+
 ## [1.1.0]
 
 ### Added
