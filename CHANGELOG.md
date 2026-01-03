@@ -10,6 +10,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [1.3.0]
+
+### Changed
+
+- Default VM disk mode switched from `overlay` to `copy`.
+  - `copy` is now the recommended default for long-lived service VMs to avoid dependency on shared base image paths or permissions across reboots.
+  - `overlay` remains available for short-lived or disposable VMs.
+- Disk mode prompt updated with clearer guidance on when to use `copy` vs `overlay`.
+
+### Added
+
+- Disk mode (`DISK_MODE_DEFAULT`) is now persisted in `/etc/create-vm-profile.conf`.
+  - Allows consistent behaviour across VM creations without re-prompting.
+  - Sensitive or per-VM values (VM name, usernames, passwords) are intentionally not stored.
+
+### Fixed
+
+- Prevented VM start failures after host reboot caused by inaccessible backing images when using overlay mode for long-lived VMs.
+
+---
+
 ## [1.2.0]
 
 ### Added
