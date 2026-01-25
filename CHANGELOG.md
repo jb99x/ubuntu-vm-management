@@ -10,6 +10,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [1.3.1]
+
+### Fixed
+
+- Unattended maintenance timer failure where maintenance.service exited with: `ERROR: Run as a normal user with sudo, not root.`
+- Maintenance script now runs correctly under systemd as root while still supporting interactive runs via sudo for manual execution.
+- Prevented false failures caused by network-online.target delays by removing hard dependency on systemd-networkd-wait-online.
+
+### Changed
+
+- Ensured DEBIAN_FRONTEND=noninteractive is enforced during unattended runs.
+- Increased systemd service robustness for long-running package operations.
+- Clarified unattended vs interactive execution paths to avoid privilege-related edge cases.
+
+### Security
+
+- No reduction in privilege separation or safety checks.
+- Root execution is limited to systemd-invoked unattended mode only; interactive safeguards remain in place.
+
+---
+
 ## [1.3.0]
 
 ### Changed

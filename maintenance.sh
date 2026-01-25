@@ -2,6 +2,18 @@
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
+
+# Root helper (systemd runs services as root; interactive runs can be non-root with sudo)
+IS_ROOT=0
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then IS_ROOT=1; fi
+run_root() {
+  if (( IS_ROOT )); then
+    "$@"
+  else
+    run_root "$@"
+  fi
+}
+
 # ==============================================================================
 # maintenance.sh — Generic Ubuntu host/VM maintenance (safe defaults)
 #
@@ -14,10 +26,10 @@ set -euo pipefail
 # Install location (recommended): /usr/local/sbin/maintenance
 # Profile (root-owned):          /etc/maintenance-profile.conf
 #
-# Version: v1.2.1
+# Version: v1.2.2
 # ==============================================================================
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 PROFILE_PATH="/etc/maintenance-profile.conf"
 
@@ -118,7 +130,7 @@ load_profile_if_present() {
   if [[ -f "${PROFILE_PATH}" ]]; then
     info "Profile detected: ${PROFILE_PATH}"
     local tmp; tmp="$(mktemp)"
-    sudo cat "${PROFILE_PATH}" > "${tmp}"
+    run_root cat "${PROFILE_PATH}" > "${tmp}"
     # shellcheck disable=SC1090
     source "${tmp}"
     rm -f "${tmp}"
@@ -193,7 +205,7 @@ save_profile() {
     echo
   } > "${tmp}"
 
-  sudo install -m 600 -o root -g root "${tmp}" "${PROFILE_PATH}"
+  run_root install -m 600 -o root -g root "${tmp}" "${PROFILE_PATH}"
   rm -f "${tmp}"
   info "Saved profile to ${PROFILE_PATH}"
 }
@@ -223,7 +235,7 @@ self_update() {
 
   local dest="/usr/local/sbin/maintenance"
   confirm_yn "Install/update to ${dest}?" || { rm -f "${tmp}"; info "Aborted."; exit 0; }
-  sudo install -m 0755 -o root -g root "${tmp}" "${dest}"
+  run_root install -m 0755 -o root -g root "${tmp}" "${dest}"
   rm -f "${tmp}"
   info "Installed ${dest}"
   exit 0
@@ -273,15 +285,15 @@ install_timer() {
   cat > "${svc_tmp}" <<EOF
 [Unit]
 Description=Maintenance (unattended)
-Wants=network-online.target
-After=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/maintenance --unattended
+Environment=DEBIAN_FRONTEND=noninteractive
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+TimeoutStartSec=6h
 EOF
 
   cat > "${tmr_tmp}" <<EOF
@@ -296,12 +308,12 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-  sudo install -m 0644 -o root -g root "${svc_tmp}" "/etc/systemd/system/${unit}.service"
-  sudo install -m 0644 -o root -g root "${tmr_tmp}" "/etc/systemd/system/${unit}.timer"
+  run_root install -m 0644 -o root -g root "${svc_tmp}" "/etc/systemd/system/${unit}.service"
+  run_root install -m 0644 -o root -g root "${tmr_tmp}" "/etc/systemd/system/${unit}.timer"
   rm -f "${svc_tmp}" "${tmr_tmp}"
 
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now "${unit}.timer"
+  run_root systemctl daemon-reload
+  run_root systemctl enable --now "${unit}.timer"
   info "Installed and enabled ${unit}.timer"
 }
 
@@ -310,18 +322,18 @@ EOF
 # -------------------------------
 ensure_timezone() {
   [[ -n "${TIMEZONE}" ]] || TIMEZONE="${DEFAULT_TIMEZONE}"
-  sudo timedatectl set-timezone "${TIMEZONE}" >/dev/null 2>&1 || true
+  run_root timedatectl set-timezone "${TIMEZONE}" >/dev/null 2>&1 || true
 }
 
 ensure_unattended_upgrades() {
   [[ "${DO_UNATTENDED_UPGRADES}" == "true" ]] || return 0
-  sudo apt-get update -qq
-  sudo apt-get install -y unattended-upgrades >/dev/null
+  run_root apt-get update -qq
+  run_root apt-get install -y unattended-upgrades >/dev/null
   # Enable apt timers/services (Ubuntu uses systemd timers)
-  sudo systemctl enable --now unattended-upgrades.service >/dev/null 2>&1 || true
-  sudo systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  run_root systemctl enable --now unattended-upgrades.service >/dev/null 2>&1 || true
+  run_root systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
   # Ensure /etc/apt/apt.conf.d/20auto-upgrades is sane
-  sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
+  run_root tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
@@ -331,23 +343,23 @@ apt_maintenance() {
   [[ "${DO_APT_MAINT}" == "true" ]] || return 0
   # Noninteractive reduces prompts; preserve config files sensibly.
   export DEBIAN_FRONTEND=noninteractive
-  sudo apt-get update
-  sudo apt-get -y full-upgrade
-  sudo apt-get -y autoremove
-  sudo apt-get -y autoclean
-  sudo apt-get check || true
+  run_root apt-get update
+  run_root apt-get -y full-upgrade
+  run_root apt-get -y autoremove
+  run_root apt-get -y autoclean
+  run_root apt-get check || true
 }
 
 journal_vacuum() {
   [[ "${DO_JOURNAL_VACUUM}" == "true" ]] || return 0
   need_cmd journalctl || return 0
-  sudo journalctl --vacuum-time="${JOURNAL_MAX_AGE}" >/dev/null 2>&1 || true
+  run_root journalctl --vacuum-time="${JOURNAL_MAX_AGE}" >/dev/null 2>&1 || true
 }
 
 run_logrotate() {
   [[ "${DO_LOGROTATE}" == "true" ]] || return 0
   [[ -x /usr/sbin/logrotate ]] || return 0
-  sudo logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
+  run_root logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
 }
 
 run_trim() {
@@ -357,7 +369,7 @@ run_trim() {
     auto) need_cmd fstrim || return 0 ;;
     *) warn "Unknown DO_TRIM='${DO_TRIM}', skipping"; return 0 ;;
   esac
-  sudo fstrim -av >/dev/null 2>&1 || true
+  run_root fstrim -av >/dev/null 2>&1 || true
 }
 
 reboot_if_required() {
@@ -366,9 +378,9 @@ reboot_if_required() {
   info "Reboot required flag present: /var/run/reboot-required"
   if [[ "${UNATTENDED}" == "true" ]]; then
     info "Unattended run: rebooting now."
-    sudo systemctl reboot
+    run_root systemctl reboot
   else
-    confirm_yn "Reboot now?" && sudo systemctl reboot
+    confirm_yn "Reboot now?" && run_root systemctl reboot
   fi
 }
 
@@ -376,9 +388,9 @@ scheduled_reboot_if_enabled() {
   [[ "${DO_SCHEDULED_REBOOT}" == "true" ]] || return 0
   if [[ "${UNATTENDED}" == "true" ]]; then
     info "Scheduled reboot enabled: rebooting now."
-    sudo systemctl reboot
+    run_root systemctl reboot
   else
-    confirm_yn "Scheduled reboot enabled. Reboot now?" && sudo systemctl reboot
+    confirm_yn "Scheduled reboot enabled. Reboot now?" && run_root systemctl reboot
   fi
 }
 
@@ -438,12 +450,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 # -------------------------------
-# Safety / sudo
-# -------------------------------
+# Safety / run_root # -------------------------------
 if [[ "$EUID" -eq 0 ]]; then
   die "Run as a normal user with sudo, not root."
 fi
-sudo -v
+if (( ! IS_ROOT )); then sudo -v; fi
 
 load_profile_if_present
 
