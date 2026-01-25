@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ---
 
+## [1.3.2]
+
+### Fixed
+
+- `maintenance.sh`: systemd/timer unattended runs no longer fail due to “Run as a normal user with sudo, not root.”
+  The script now supports root execution for `--unattended`, `--install`, and `--self-update`, and treats `sudo` as a no-op when already running as root.
+
+---
+
 ## [1.3.1]
 
 ### Fixed
